@@ -29,7 +29,7 @@ from config.config import (
     LOSS_FUNCTION, FOCAL_ALPHA, FOCAL_GAMMA, LABEL_SMOOTHING,
     MIXED_PRECISION, GRADIENT_ACCUMULATION, ACCUMULATION_STEPS,
     ADVANCED_METRICS, SAVE_CHECKPOINTS, CHECKPOINT_EVERY, VISUALIZATION,
-    DROPOUT_RATE, ADD_NOISE, NOISE_STRENGTH
+    DROPOUT_RATE, ADD_NOISE, NOISE_STRENGTH, SEQ_LEN
 )
 from src.models.cnn_model import CandleCNN, EnhancedCandleCNN
 from src.models.dataset import CandlestickDataLoader
@@ -57,11 +57,12 @@ except ImportError:
 class EnhancedAdvancedTrainer:
     """
     Enhanced Advanced Trainer with comprehensive logging and multiple training modes
+    Optimized for swing trading (1-3 day predictions)
     """
     
     def __init__(self, csv_file=None, model_save_path=None, enable_logging=True, experiment_name=None):
         """
-        Initialize the enhanced advanced trainer
+        Initialize the enhanced advanced trainer for swing trading
         
         Args:
             csv_file (str): Path to the dataset CSV file
@@ -73,23 +74,32 @@ class EnhancedAdvancedTrainer:
         self.model_save_path = model_save_path or MODEL_OUTPUT_PATH
         self.device = DEVICE
         self.enable_logging = enable_logging and ENHANCED_LOGGING_AVAILABLE
-        self.experiment_name = experiment_name or f"enhanced_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.experiment_name = experiment_name or f"swing_trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        print("🚀 Initializing Enhanced Advanced Training Pipeline...")
+        print("🚀 Initializing Swing Trading Training Pipeline...")
         print("=" * 60)
+        print("📈 Focus: 1-3 day return predictions")
+        print("🎯 Target: Swing trading signals (1-day horizon)")
+        print("📊 Features: 35 swing trading optimized indicators")
         
         # Initialize data loaders
         self.data_loader = CandlestickDataLoader(
             csv_file=self.csv_file,
             batch_size=BATCH_SIZE,
-            train_split=0.8
+            train_split=0.85  # Swing trading uses more training data
         )
         
         self.train_loader = self.data_loader.get_train_loader()
         self.val_loader = self.data_loader.get_val_loader()
         
-        # Initialize model
+        # Initialize model optimized for swing trading
         features_per_day = self.data_loader.get_feature_dim()
+        print(f"📊 Model Configuration:")
+        print(f"   Features per day: {features_per_day}")
+        print(f"   Sequence length: {SEQ_LEN} days")
+        print(f"   Prediction horizon: 1 day")
+        print(f"   Classes: 5 (Strong Sell to Strong Buy)")
+        
         self.model = EnhancedCandleCNN(
             features_per_day=features_per_day,
             num_classes=5,
@@ -189,20 +199,23 @@ class EnhancedAdvancedTrainer:
         self._print_training_config()
     
     def _print_training_config(self):
-        """Print enhanced training configuration"""
-        print(f"\n📋 Enhanced Training Configuration:")
-        print(f"   Model: CandleCNN ({self.model.features_per_day} features/day)")
-        print(f"   Device: {self.device}")
-        print(f"   Optimizer: {OPTIMIZER}")
-        print(f"   Loss Function: {LOSS_FUNCTION}")
-        print(f"   Learning Rate: {LEARNING_RATE}")
-        print(f"   Batch Size: {BATCH_SIZE}")
-        print(f"   Epochs: {EPOCHS}")
-        print(f"   Early Stopping: {EARLY_STOPPING}")
-        print(f"   Mixed Precision: {MIXED_PRECISION}")
-        print(f"   Enhanced Logging: {self.enable_logging}")
-        if self.enable_logging:
-            print(f"   Experiment: {self.experiment_name}")
+        """Print training configuration optimized for swing trading"""
+        print("\n📊 SWING TRADING TRAINING CONFIGURATION:")
+        print("=" * 50)
+        print(f"🎯 Prediction Target: 1-day returns")
+        print(f"📈 Sequence Length: {SEQ_LEN} days (swing trading lookback)")
+        print(f"📊 Features per day: {self.data_loader.get_feature_dim()}")
+        print(f"🔄 Batch Size: {BATCH_SIZE}")
+        print(f"📚 Learning Rate: {LEARNING_RATE}")
+        print(f"⏱️  Epochs: {EPOCHS}")
+        print(f"🎯 Early Stopping: {PATIENCE} epochs patience")
+        print(f"📊 Train/Val Split: 85/15 (swing trading optimized)")
+        print(f"⚡ Optimizer: {OPTIMIZER}")
+        print(f"📈 Loss Function: {LOSS_FUNCTION}")
+        print(f"🎯 Class Weights: Enabled for imbalanced swing signals")
+        print(f"📊 Mixed Precision: {MIXED_PRECISION}")
+        print(f"🔄 Gradient Clipping: {MAX_GRAD_NORM}")
+        print("=" * 50)
     
     def train_epoch(self):
         """

@@ -10,15 +10,16 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from config.config import DATA_OUTPUT_PATH, MODEL_OUTPUT_PATH
-from src.data.data_collection import build_dataset, compare_adjusted_vs_raw_analysis
+from src.data.data_collection import build_dataset, build_dataset_incremental, build_dataset_smart_update, compare_adjusted_vs_raw_analysis
 from src.training.train import Trainer
 from src.inference.predict import CandlestickPredictor, demo_prediction
+from src.inference.trading_signals import TradingSignalGenerator
 
 
 def main():
     """Main function with command line interface"""
     parser = argparse.ArgumentParser(description='Candlestick Pattern Price Model')
-    parser.add_argument('--mode', choices=['data', 'train', 'predict', 'demo', 'all'], 
+    parser.add_argument('--mode', choices=['data', 'train', 'predict', 'demo', 'all', 'signals'], 
                        default='demo', help='Mode to run')
     parser.add_argument('--ticker', type=str, default='AAPL', 
                        help='Ticker to predict (for predict mode)')
@@ -31,6 +32,16 @@ def main():
     # Note: Removed --no-adjusted flag since professional pipeline always uses both raw and adjusted
     parser.add_argument('--compare-adjustment', action='store_true',
                        help='Compare raw vs adjusted close analysis')
+    parser.add_argument('--incremental', action='store_true',
+                       help='Use incremental data collection (saves every 100 tickers)')
+    parser.add_argument('--save-interval', type=int, default=100,
+                       help='Save data every N tickers (default: 100)')
+    parser.add_argument('--smart-update', action='store_true',
+                       help='Smart update: only collect recent data for new tickers and updates')
+    parser.add_argument('--days-back', type=int, default=30,
+                       help='Days of recent data to collect for updates (default: 30)')
+    parser.add_argument('--portfolio', type=str, nargs='+', default=['AAPL', 'MSFT', 'GOOGL'],
+                       help='List of tickers for portfolio signals')
     
     args = parser.parse_args()
     
@@ -57,7 +68,17 @@ def main():
         print("Using explicit raw/adjusted column families for maximum accuracy")
         
         try:
-            dataset_path = build_dataset(args.data_file)
+            if args.incremental:
+                print("🔄 Using incremental data collection mode")
+                print(f"💾 Saving data every {args.save_interval} tickers")
+                print("⚠️  Press Ctrl+C to stop gracefully and save collected data")
+                dataset_path = build_dataset_incremental(args.data_file, args.save_interval)
+            elif args.smart_update:
+                print("🧠 Using smart update mode")
+                print(f"📅 Collecting {args.days_back} days of recent data for updates")
+                dataset_path = build_dataset_smart_update(args.data_file, args.days_back)
+            else:
+                dataset_path = build_dataset(args.data_file)
             print(f"✅ Professional dataset created successfully: {dataset_path}")
         except Exception as e:
             print(f"❌ Error building dataset: {e}")
@@ -98,12 +119,42 @@ def main():
                 print(f"❌ Error predicting {args.ticker}: {result['error']}")
             else:
                 print(f"📈 Prediction for {args.ticker}:")
-                print(f"   Signal: {result['signal_description']}")
-                print(f"   Confidence: {result['confidence']:.3f}")
-                print(f"   Raw signal: {result['signal']}")
-            
+                print(f"   Prediction: {result['prediction']}")
+                print(f"   Confidence: {result['confidence']:.2%}")
         except Exception as e:
             print(f"❌ Error during prediction: {e}")
+            if args.mode != 'all':
+                return
+    
+    if args.mode == 'signals':
+        print(f"\n🎯 Generating trading signals for portfolio...")
+        print("-" * 40)
+        try:
+            if not os.path.exists(args.model_file):
+                print(f"❌ Model not found: {args.model_file}")
+                print("Please run with --mode train first")
+                return
+            
+            generator = TradingSignalGenerator(args.model_file)
+            
+            print(f"📊 Analyzing {len(args.portfolio)} stocks: {', '.join(args.portfolio)}")
+            signals = generator.get_portfolio_signals(args.portfolio)
+            
+            # Print summary
+            print(f"\n🏆 TOP TRADING OPPORTUNITIES:")
+            for i, signal in enumerate(signals[:5], 1):
+                if 'error' not in signal:
+                    print(f"{i}. {signal['ticker']}: {signal['recommendation']} "
+                          f"(Strength: {signal['signal_strength']:.1%})")
+            
+            # Detailed report for best signal
+            if signals and 'error' not in signals[0]:
+                generator.print_signal_report(signals[0])
+                
+        except Exception as e:
+            print(f"❌ Error generating signals: {e}")
+            if args.mode != 'all':
+                return
     
     if args.mode == 'demo' or args.mode == 'all':
         print("\n🎯 Running prediction demo...")
