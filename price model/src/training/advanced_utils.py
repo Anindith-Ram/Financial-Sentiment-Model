@@ -286,10 +286,14 @@ def get_scheduler(optimizer, scheduler_name, **kwargs):
         return ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.5, verbose=True)
 
 
-def get_loss_function(loss_name, num_classes=5, class_weights=None, **kwargs):
+def get_loss_function(loss_name, num_classes=5, class_weights=None, device='cpu', **kwargs):
     """
     Get loss function by name
     """
+    # Move class weights to device if provided
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+    
     if loss_name == "CrossEntropy":
         return nn.CrossEntropyLoss(weight=class_weights)
     elif loss_name == "FocalLoss":
