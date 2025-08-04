@@ -46,7 +46,20 @@ BATCH_SIZE = TRAINING_CONFIG['BATCH_SIZE']
 EPOCHS = TRAINING_CONFIG['EPOCHS']
 LEARNING_RATE = TRAINING_CONFIG['LEARNING_RATE']
 PATTERNS = TECHNICAL_CONFIG['PATTERNS']
-DEVICE = MODEL_CONFIG['DEVICE']
+
+# Automatic device detection
+import torch
+if MODEL_CONFIG['DEVICE'] == 'cuda' and torch.cuda.is_available():
+    DEVICE = 'cuda'
+    # Only print CUDA info during training, not data collection
+    if 'train' in sys.argv or 'predict' in sys.argv:
+        print(f"🚀 Using CUDA device: {torch.cuda.get_device_name(0)}")
+elif MODEL_CONFIG['DEVICE'] == 'cuda' and not torch.cuda.is_available():
+    DEVICE = 'cpu'
+    print("⚠️  CUDA requested but not available. Falling back to CPU.")
+else:
+    DEVICE = MODEL_CONFIG['DEVICE']
+
 DATA_OUTPUT_PATH = DATA_CONFIG['DATA_OUTPUT_PATH']
 MODEL_OUTPUT_PATH = DATA_CONFIG['MODEL_OUTPUT_PATH']
 USE_ADJUSTED_CLOSE = DATA_CONFIG['USE_ADJUSTED_CLOSE']

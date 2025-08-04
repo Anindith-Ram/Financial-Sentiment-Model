@@ -1,6 +1,13 @@
 """
 Unified Data Collection with Adjusted Close Integration
 Combines enhanced features with streamlined functionality
+
+🔧 ENHANCED WITH SAFE INDICATOR FUNCTIONS
+- Prevents NaN propagation from insufficient data
+- Adaptive indicator periods based on data availability
+- Comprehensive data quality validation
+- Graceful handling of technical indicator failures
+- Automatic data quality improvements (optional)
 """
 import yfinance as yf
 import pandas as pd
@@ -8,13 +15,17 @@ import numpy as np
 import talib
 import signal
 import sys
+import os
+import argparse
 from datetime import datetime, timedelta
+from typing import Tuple, Dict, Optional
 from config.config import (
     TICKERS_CSV, N_TICKERS, START, END, SEQ_LEN, HORIZON, 
     PATTERNS, DATA_OUTPUT_PATH, USE_RAW_COLS, USE_ADJ_COLS
 )
 from src.utils.helpers import label_class
-import os
+import warnings
+warnings.filterwarnings('ignore')
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -22,12 +33,814 @@ shutdown_requested = False
 def signal_handler(signum, frame):
     """Handle interrupt signals gracefully"""
     global shutdown_requested
-    print(f"\n⚠️  Interrupt signal received. Saving collected data and shutting down gracefully...")
+    print(f"\n[WARNING] Interrupt signal received. Saving collected data and shutting down gracefully...")
     shutdown_requested = True
 
 # Register signal handlers
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ===== DATA QUALITY IMPROVEMENT FUNCTIONS =====
+
+def analyze_data_quality(df):
+    """
+    Comprehensive data quality analysis
+    
+    Args:
+        df (pd.DataFrame): Input dataframe
+        
+    Returns:
+        dict: Quality analysis results
+    """
+    print("[SEARCH] Analyzing data quality...")
+    
+    analysis = {
+        'total_rows': len(df),
+        'total_columns': len(df.columns),
+        'nan_analysis': {},
+        'extreme_values_analysis': {},
+        'class_imbalance_analysis': {},
+        'recommendations': []
+    }
+    
+    # 1. NaN Analysis
+    nan_counts = df.isnull().sum()
+    total_nan = nan_counts.sum()
+    nan_ratio = total_nan / (len(df) * len(df.columns))
+    
+    analysis['nan_analysis'] = {
+        'total_nan': total_nan,
+        'nan_ratio': nan_ratio,
+        'columns_with_nan': nan_counts[nan_counts > 0].to_dict(),
+        'severity': 'high' if nan_ratio > 0.1 else 'medium' if nan_ratio > 0.01 else 'low'
+    }
+    
+    print(f"[CHART] NaN Analysis:")
+    print(f"  Total NaN values: {total_nan:,}")
+    print(f"  NaN ratio: {nan_ratio:.2%}")
+    print(f"  Columns with NaN: {len(nan_counts[nan_counts > 0])}")
+    
+    # 2. Extreme Values Analysis
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    extreme_threshold = 1e10
+    extreme_counts = {}
+    total_extreme = 0
+    
+    for col in numeric_cols:
+        if col in df.columns:
+            extreme_mask = df[col].abs() > extreme_threshold
+            extreme_count = extreme_mask.sum()
+            extreme_counts[col] = int(extreme_count)
+            total_extreme += extreme_count
+    
+    analysis['extreme_values_analysis'] = {
+        'total_extreme': total_extreme,
+        'extreme_by_column': extreme_counts,
+        'columns_with_extreme': len([c for c, count in extreme_counts.items() if count > 0]),
+        'severity': 'high' if total_extreme > 10000 else 'medium' if total_extreme > 1000 else 'low'
+    }
+    
+    print(f"[CHART] Extreme Values Analysis:")
+    print(f"  Total extreme values: {total_extreme:,}")
+    print(f"  Columns with extreme values: {analysis['extreme_values_analysis']['columns_with_extreme']}")
+    
+    # 3. Class Imbalance Analysis
+    if 'Label' in df.columns:
+        class_counts = df['Label'].value_counts()
+        min_class_count = class_counts.min()
+        max_class_count = class_counts.max()
+        imbalance_ratio = max_class_count / min_class_count
+        
+        analysis['class_imbalance_analysis'] = {
+            'class_distribution': class_counts.to_dict(),
+            'imbalance_ratio': imbalance_ratio,
+            'minority_class': class_counts.idxmin(),
+            'majority_class': class_counts.idxmax(),
+            'severity': 'high' if imbalance_ratio > 5 else 'medium' if imbalance_ratio > 2 else 'low'
+        }
+        
+        print(f"[CHART] Class Imbalance Analysis:")
+        print(f"  Imbalance ratio: {imbalance_ratio:.1f}:1")
+        print(f"  Minority class: {analysis['class_imbalance_analysis']['minority_class']} ({min_class_count:,} samples)")
+        print(f"  Majority class: {analysis['class_imbalance_analysis']['majority_class']} ({max_class_count:,} samples)")
+    
+    return analysis
+
+
+def handle_nan_values(df, strategy='auto'):
+    """
+    Handle NaN values using various strategies
+    
+    Args:
+        df (pd.DataFrame): Input dataframe
+        strategy (str): 'auto', 'drop', 'fill_mean', 'fill_median', 'interpolate'
+        
+    Returns:
+        pd.DataFrame: DataFrame with NaN values handled
+    """
+    print(f"[TOOLS] Handling NaN values with strategy: {strategy}")
+    
+    df_clean = df.copy()
+    original_nan = df.isnull().sum().sum()
+    
+    if strategy == 'auto':
+        # Automatic strategy based on data characteristics
+        for col in df_clean.columns:
+            if df_clean[col].isnull().sum() > 0:
+                col_type = df_clean[col].dtype
+                
+                if col_type in ['object', 'string']:
+                    # For categorical/text data, fill with mode or 'Unknown'
+                    mode_val = df_clean[col].mode()
+                    fill_val = mode_val[0] if len(mode_val) > 0 else 'Unknown'
+                    df_clean[col] = df_clean[col].fillna(fill_val)
+                else:
+                    # For numeric data, use interpolation for time series, median for others
+                    if col in ['Open', 'High', 'Low', 'Close', 'Volume'] or 'Close' in col:
+                        df_clean[col] = df_clean[col].interpolate(method='linear')
+                    else:
+                        df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+    
+    elif strategy == 'drop':
+        # Drop rows with any NaN values
+        df_clean = df_clean.dropna()
+    
+    elif strategy == 'fill_mean':
+        # Fill numeric columns with mean
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].mean())
+    
+    elif strategy == 'fill_median':
+        # Fill numeric columns with median
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+    
+    elif strategy == 'interpolate':
+        # Use interpolation for all numeric columns
+        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            df_clean[col] = df_clean[col].interpolate(method='linear')
+    
+    remaining_nan = df_clean.isnull().sum().sum()
+    print(f"[SUCCESS] NaN values reduced from {original_nan:,} to {remaining_nan:,}")
+    
+    return df_clean
+
+
+def handle_extreme_values(df, method='isolation_forest', threshold=1e10):
+    """
+    Handle extreme values using various methods
+    
+    Args:
+        df (pd.DataFrame): Input dataframe
+        method (str): 'isolation_forest', 'iqr', 'zscore', 'winsorize'
+        threshold (float): Threshold for extreme values
+        
+    Returns:
+        pd.DataFrame: DataFrame with extreme values handled
+    """
+    print(f"[TOOLS] Handling extreme values with method: {method}")
+    
+    df_clean = df.copy()
+    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
+    
+    if method == 'isolation_forest':
+        try:
+            from sklearn.ensemble import IsolationForest
+            # Use Isolation Forest to detect outliers
+            for col in numeric_cols:
+                if col in df_clean.columns:
+                    # Remove NaN values for outlier detection
+                    col_data = df_clean[col].dropna()
+                    if len(col_data) > 0:
+                        # Reshape for sklearn
+                        X = col_data.values.reshape(-1, 1)
+                        
+                        # Fit isolation forest
+                        iso_forest = IsolationForest(contamination=0.1, random_state=42)
+                        outliers = iso_forest.fit_predict(X)
+                        
+                        # Replace outliers with median
+                        outlier_indices = col_data.index[outliers == -1]
+                        if len(outlier_indices) > 0:
+                            median_val = col_data.median()
+                            df_clean.loc[outlier_indices, col] = median_val
+                            print(f"  [CHART] {col}: Replaced {len(outlier_indices)} outliers with median")
+        except ImportError:
+            print("[WARNING] sklearn not available, skipping extreme value handling")
+    
+    elif method == 'iqr':
+        # Use IQR method to detect and handle outliers
+        for col in numeric_cols:
+            if col in df_clean.columns:
+                Q1 = df_clean[col].quantile(0.25)
+                Q3 = df_clean[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                
+                # Replace outliers with bounds
+                df_clean[col] = df_clean[col].clip(lower=lower_bound, upper=upper_bound)
+    
+    elif method == 'zscore':
+        # Use Z-score method
+        for col in numeric_cols:
+            if col in df_clean.columns:
+                z_scores = np.abs((df_clean[col] - df_clean[col].mean()) / df_clean[col].std())
+                outlier_mask = z_scores > 3
+                
+                if outlier_mask.sum() > 0:
+                    median_val = df_clean[col].median()
+                    df_clean.loc[outlier_mask, col] = median_val
+    
+    elif method == 'winsorize':
+        # Winsorize extreme values
+        for col in numeric_cols:
+            if col in df_clean.columns:
+                q_low = df_clean[col].quantile(0.01)
+                q_high = df_clean[col].quantile(0.99)
+                df_clean[col] = df_clean[col].clip(lower=q_low, upper=q_high)
+    
+    return df_clean
+
+
+def handle_class_imbalance(df, method='smote', target_col='Label'):
+    """
+    Handle class imbalance using various techniques
+    
+    Args:
+        df (pd.DataFrame): Input dataframe
+        method (str): 'smote', 'undersample', 'oversample', 'class_weights'
+        target_col (str): Target column name
+        
+    Returns:
+        pd.DataFrame: Balanced dataframe
+    """
+    if target_col not in df.columns:
+        print(f"[WARNING] Target column '{target_col}' not found. Skipping class balancing.")
+        return df
+    
+    print(f"[TOOLS] Handling class imbalance with method: {method}")
+    
+    # Analyze current class distribution
+    class_counts = df[target_col].value_counts()
+    imbalance_ratio = class_counts.max() / class_counts.min()
+    
+    print(f"[CHART] Original class distribution:")
+    for class_label, count in class_counts.items():
+        print(f"  Class {class_label}: {count:,} samples")
+    print(f"  Imbalance ratio: {imbalance_ratio:.1f}:1")
+    
+    if method == 'undersample':
+        # Undersample majority class
+        minority_class = class_counts.idxmin()
+        minority_count = class_counts.min()
+        
+        balanced_dfs = []
+        for class_label in class_counts.index:
+            class_df = df[df[target_col] == class_label]
+            if len(class_df) > minority_count:
+                # Undersample to match minority class
+                class_df = class_df.sample(n=minority_count, random_state=42)
+            balanced_dfs.append(class_df)
+        
+        df_balanced = pd.concat(balanced_dfs, ignore_index=True)
+        print(f"[SUCCESS] Undersampled to {len(df_balanced):,} samples")
+    
+    elif method == 'oversample':
+        # Oversample minority class
+        majority_class = class_counts.idxmax()
+        majority_count = class_counts.max()
+        
+        balanced_dfs = []
+        for class_label in class_counts.index:
+            class_df = df[df[target_col] == class_label]
+            if len(class_df) < majority_count:
+                # Oversample to match majority class
+                from sklearn.utils import resample
+                class_df = resample(class_df, 
+                                  n_samples=majority_count, 
+                                  random_state=42, 
+                                  replace=True)
+            balanced_dfs.append(class_df)
+        
+        df_balanced = pd.concat(balanced_dfs, ignore_index=True)
+        print(f"[SUCCESS] Oversampled to {len(df_balanced):,} samples")
+    
+    elif method == 'smote':
+        try:
+            from imblearn.over_sampling import SMOTE
+            
+            # Prepare features and target
+            feature_cols = [col for col in df.columns if col != target_col]
+            X = df[feature_cols]
+            y = df[target_col]
+            
+            # Apply SMOTE
+            smote = SMOTE(random_state=42)
+            X_balanced, y_balanced = smote.fit_resample(X, y)
+            
+            # Reconstruct dataframe
+            df_balanced = pd.DataFrame(X_balanced, columns=feature_cols)
+            df_balanced[target_col] = y_balanced
+            
+            print(f"[SUCCESS] SMOTE applied: {len(df_balanced):,} samples")
+            
+        except ImportError:
+            print("[WARNING] SMOTE not available. Falling back to oversampling.")
+            return handle_class_imbalance(df, method='oversample', target_col=target_col)
+    
+    else:  # class_weights
+        # Return original data with class weight information
+        df_balanced = df.copy()
+        print(f"[INFO] Using class weights approach (no data modification)")
+    
+    # Show new distribution
+    new_class_counts = df_balanced[target_col].value_counts()
+    new_imbalance_ratio = new_class_counts.max() / new_class_counts.min()
+    
+    print(f"[CHART] New class distribution:")
+    for class_label, count in new_class_counts.items():
+        print(f"  Class {class_label}: {count:,} samples")
+    print(f"  New imbalance ratio: {new_imbalance_ratio:.1f}:1")
+    
+    return df_balanced
+
+
+def apply_data_quality_pipeline(df, nan_strategy='auto', extreme_method='isolation_forest', 
+                              balance_method='smote', target_col='Label'):
+    """
+    Apply complete data quality improvement pipeline
+    
+    Args:
+        df (pd.DataFrame): Input dataframe
+        nan_strategy (str): NaN handling strategy
+        extreme_method (str): Extreme value handling method
+        balance_method (str): Class balancing method
+        target_col (str): Target column for balancing
+        
+    Returns:
+        pd.DataFrame: Cleaned and balanced dataframe
+    """
+    print("[ROCKET] Starting Data Quality Improvement Pipeline")
+    print("=" * 60)
+    
+    # Step 1: Analyze current quality
+    analysis = analyze_data_quality(df)
+    
+    # Step 2: Handle NaN values
+    print(f"\n[STEP 1] Handling NaN values...")
+    df_clean = handle_nan_values(df, strategy=nan_strategy)
+    
+    # Step 3: Handle extreme values
+    print(f"\n[STEP 2] Handling extreme values...")
+    df_clean = handle_extreme_values(df_clean, method=extreme_method)
+    
+    # Step 4: Handle class imbalance
+    print(f"\n[STEP 3] Handling class imbalance...")
+    df_balanced = handle_class_imbalance(df_clean, method=balance_method, target_col=target_col)
+    
+    # Step 5: Final analysis
+    print(f"\n[STEP 4] Final quality analysis...")
+    final_analysis = analyze_data_quality(df_balanced)
+    
+    # Summary
+    print(f"\n[FINISH] Data Quality Improvement Complete!")
+    print(f"[CHART] Summary:")
+    print(f"  Original rows: {analysis['total_rows']:,}")
+    print(f"  Final rows: {final_analysis['total_rows']:,}")
+    print(f"  NaN reduction: {analysis['nan_analysis']['total_nan']:,} → {final_analysis['nan_analysis']['total_nan']:,}")
+    print(f"  Extreme values: {analysis['extreme_values_analysis']['total_extreme']:,} → {final_analysis['extreme_values_analysis']['total_extreme']:,}")
+    
+    if 'class_imbalance_analysis' in analysis and 'class_imbalance_analysis' in final_analysis:
+        original_ratio = analysis['class_imbalance_analysis']['imbalance_ratio']
+        final_ratio = final_analysis['class_imbalance_analysis']['imbalance_ratio']
+        print(f"  Class imbalance: {original_ratio:.1f}:1 → {final_ratio:.1f}:1")
+    
+    return df_balanced
+
+
+def save_quality_report(df_original, df_cleaned, output_path):
+    """
+    Save a comprehensive quality improvement report
+    
+    Args:
+        df_original (pd.DataFrame): Original dataframe
+        df_cleaned (pd.DataFrame): Cleaned dataframe
+        output_path (str): Path to save report
+    """
+    report = []
+    report.append("DATA QUALITY IMPROVEMENT REPORT")
+    report.append("=" * 50)
+    report.append("")
+    
+    # Original vs Cleaned comparison
+    report.append("BEFORE vs AFTER COMPARISON:")
+    report.append(f"  Original rows: {len(df_original):,}")
+    report.append(f"  Cleaned rows: {len(df_cleaned):,}")
+    report.append(f"  Original columns: {len(df_original.columns)}")
+    report.append(f"  Cleaned columns: {len(df_cleaned.columns)}")
+    report.append("")
+    
+    # NaN comparison
+    original_nan = df_original.isnull().sum().sum()
+    cleaned_nan = df_cleaned.isnull().sum().sum()
+    report.append("NaN VALUES:")
+    report.append(f"  Original: {original_nan:,}")
+    report.append(f"  Cleaned: {cleaned_nan:,}")
+    report.append(f"  Reduction: {original_nan - cleaned_nan:,} ({((original_nan - cleaned_nan) / original_nan * 100):.1f}%)")
+    report.append("")
+    
+    # Class distribution comparison
+    if 'Label' in df_original.columns and 'Label' in df_cleaned.columns:
+        report.append("CLASS DISTRIBUTION:")
+        original_dist = df_original['Label'].value_counts()
+        cleaned_dist = df_cleaned['Label'].value_counts()
+        
+        for class_label in sorted(original_dist.index):
+            original_count = original_dist.get(class_label, 0)
+            cleaned_count = cleaned_dist.get(class_label, 0)
+            report.append(f"  Class {class_label}: {original_count:,} → {cleaned_count:,}")
+        
+        original_ratio = original_dist.max() / original_dist.min()
+        cleaned_ratio = cleaned_dist.max() / cleaned_dist.min()
+        report.append(f"  Imbalance ratio: {original_ratio:.1f}:1 → {cleaned_ratio:.1f}:1")
+        report.append("")
+    
+    # Save report
+    with open(output_path, 'w') as f:
+        f.write('\n'.join(report))
+    
+    print(f"[SAVE] Quality report saved to: {output_path}")
+
+
+# ===== SAFE INDICATOR FUNCTIONS =====
+
+def safe_sma(data: np.ndarray, period: int) -> np.ndarray:
+    """
+    Calculate SMA with safe handling of insufficient data
+    
+    Args:
+        data: Price data array
+        period: SMA period
+        
+    Returns:
+        SMA array with NaN for insufficient data
+    """
+    if len(data) < period:
+        return np.full(len(data), np.nan)
+    return talib.SMA(data, timeperiod=period)
+
+
+def safe_ema(data: np.ndarray, period: int) -> np.ndarray:
+    """Calculate EMA with safe handling of insufficient data"""
+    if len(data) < period:
+        return np.full(len(data), np.nan)
+    return talib.EMA(data, timeperiod=period)
+
+
+def safe_rsi(data: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate RSI with safe handling of insufficient data"""
+    if len(data) < period + 1:  # RSI needs period + 1
+        return np.full(len(data), np.nan)
+    return talib.RSI(data, timeperiod=period)
+
+
+def safe_macd(data: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate MACD with safe handling of insufficient data"""
+    if len(data) < slow:  # Need at least slow period
+        nan_array = np.full(len(data), np.nan)
+        return nan_array, nan_array, nan_array
+    return talib.MACD(data, fastperiod=fast, slowperiod=slow, signalperiod=signal)
+
+
+def safe_bollinger_bands(data: np.ndarray, period: int = 20, std_dev: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate Bollinger Bands with safe handling of insufficient data"""
+    if len(data) < period:
+        nan_array = np.full(len(data), np.nan)
+        return nan_array, nan_array, nan_array
+    return talib.BBANDS(data, timeperiod=period, nbdevup=std_dev, nbdevdn=std_dev)
+
+
+def safe_stochastic(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
+                   k_period: int = 14, d_period: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate Stochastic with safe handling of insufficient data"""
+    if len(high) < k_period:
+        nan_array = np.full(len(high), np.nan)
+        return nan_array, nan_array
+    return talib.STOCH(high, low, close, fastk_period=k_period, slowk_period=d_period, slowd_period=d_period)
+
+
+def safe_williams_r(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate Williams %R with safe handling of insufficient data"""
+    if len(high) < period:
+        return np.full(len(high), np.nan)
+    return talib.WILLR(high, low, close, timeperiod=period)
+
+
+def safe_cci(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 20) -> np.ndarray:
+    """Calculate CCI with safe handling of insufficient data"""
+    if len(high) < period:
+        return np.full(len(high), np.nan)
+    return talib.CCI(high, low, close, timeperiod=period)
+
+
+def safe_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate ADX with safe handling of insufficient data"""
+    if len(high) < period:
+        return np.full(len(high), np.nan)
+    return talib.ADX(high, low, close, timeperiod=period)
+
+
+def safe_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate ATR with safe handling of insufficient data"""
+    if len(high) < period:
+        return np.full(len(high), np.nan)
+    return talib.ATR(high, low, close, timeperiod=period)
+
+
+def get_adaptive_periods(data_length: int) -> Dict[str, int]:
+    """
+    Get adaptive indicator periods based on available data
+    
+    Args:
+        data_length: Number of available data points
+        
+    Returns:
+        Dictionary of indicator periods
+    """
+    if data_length < 20:
+        return {
+            'sma': 5,
+            'ema': 5,
+            'rsi': 7,
+            'macd_fast': 6,
+            'macd_slow': 12,
+            'bb': 10,
+            'stoch': 7,
+            'williams_r': 7,
+            'cci': 10,
+            'adx': 7,
+            'atr': 7
+        }
+    elif data_length < 50:
+        return {
+            'sma': 10,
+            'ema': 10,
+            'rsi': 10,
+            'macd_fast': 8,
+            'macd_slow': 16,
+            'bb': 15,
+            'stoch': 10,
+            'williams_r': 10,
+            'cci': 15,
+            'adx': 10,
+            'atr': 10
+        }
+    else:
+        return {
+            'sma': 20,
+            'ema': 20,
+            'rsi': 14,
+            'macd_fast': 12,
+            'macd_slow': 26,
+            'bb': 20,
+            'stoch': 14,
+            'williams_r': 14,
+            'cci': 20,
+            'adx': 14,
+            'atr': 14
+        }
+
+
+def validate_stock_data(df: pd.DataFrame, ticker: str, min_length: int = 100) -> Dict[str, any]:
+    """
+    Comprehensive validation of stock data quality
+    
+    Args:
+        df: Stock data DataFrame
+        ticker: Stock ticker for logging
+        min_length: Minimum required data length
+        
+    Returns:
+        Dictionary with validation results
+    """
+    validation_results = {
+        'ticker': ticker,
+        'passed': True,
+        'issues': [],
+        'metrics': {}
+    }
+    
+    # Basic data checks
+    if df.empty:
+        validation_results['passed'] = False
+        validation_results['issues'].append('Empty DataFrame')
+        return validation_results
+    
+    # Length check
+    data_length = len(df)
+    validation_results['metrics']['data_length'] = data_length
+    
+    if data_length < min_length:
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Insufficient data: {data_length} < {min_length}')
+    
+    # Required columns check
+    required_cols = ['Open_adj', 'High_adj', 'Low_adj', 'Close_adj', 'Volume_adj']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Missing columns: {missing_cols}')
+    
+    # Missing values check
+    missing_count = df[required_cols].isnull().sum().sum()
+    missing_ratio = missing_count / (len(df) * len(required_cols))
+    validation_results['metrics']['missing_ratio'] = missing_ratio
+    
+    if missing_ratio > 0.05:  # More than 5% missing
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Too many missing values: {missing_ratio:.2%}')
+    
+    # Extreme values check
+    extreme_threshold = 1e10
+    extreme_count = 0
+    
+    for col in required_cols:
+        if col in df.columns:
+            extreme_mask = df[col].abs() > extreme_threshold
+            extreme_count += extreme_mask.sum()
+    
+    validation_results['metrics']['extreme_values'] = extreme_count
+    
+    if extreme_count > 0:
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Extreme values detected: {extreme_count}')
+    
+    return validation_results
+
+
+def validate_dataset_quality(csv_file: str) -> Dict[str, any]:
+    """
+    Validate entire dataset quality
+    
+    Args:
+        csv_file: Path to dataset CSV
+        
+    Returns:
+        Dictionary with validation results
+    """
+    print(f"[SEARCH] Validating dataset: {csv_file}")
+    
+    try:
+        df = pd.read_csv(csv_file)
+    except Exception as e:
+        return {
+            'passed': False,
+            'error': f'Failed to read CSV: {e}',
+            'issues': ['CSV read error']
+        }
+    
+    validation_results = {
+        'passed': True,
+        'total_rows': len(df),
+        'total_columns': len(df.columns),
+        'issues': [],
+        'warnings': [],
+        'metrics': {}
+    }
+    
+    # Check for NaN values
+    nan_count = df.isnull().sum().sum()
+    nan_ratio = nan_count / (len(df) * len(df.columns))
+    validation_results['metrics']['nan_count'] = nan_count
+    validation_results['metrics']['nan_ratio'] = nan_ratio
+    
+    if nan_count > 0:
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Found {nan_count} NaN values ({nan_ratio:.2%})')
+    
+    # Check for infinite values
+    inf_count = np.isinf(df.select_dtypes(include=[np.number])).sum().sum()
+    validation_results['metrics']['inf_count'] = inf_count
+    
+    if inf_count > 0:
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Found {inf_count} infinite values')
+    
+    # Check for extreme values
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    extreme_threshold = 1e10
+    extreme_count = 0
+    
+    for col in numeric_cols:
+        extreme_mask = df[col].abs() > extreme_threshold
+        extreme_count += extreme_mask.sum()
+    
+    validation_results['metrics']['extreme_count'] = extreme_count
+    
+    if extreme_count > 0:
+        validation_results['passed'] = False
+        validation_results['issues'].append(f'Found {extreme_count} extreme values')
+    
+    # Check data ranges
+    for col in numeric_cols:
+        col_min = df[col].min()
+        col_max = df[col].max()
+        validation_results['metrics'][f'{col}_range'] = (col_min, col_max)
+    
+    # Check class distribution (if Label column exists)
+    if 'Label' in df.columns:
+        class_counts = df['Label'].value_counts()
+        validation_results['metrics']['class_distribution'] = class_counts.to_dict()
+        
+        # Check for class imbalance
+        min_class_count = class_counts.min()
+        max_class_count = class_counts.max()
+        imbalance_ratio = max_class_count / min_class_count
+        
+        validation_results['metrics']['imbalance_ratio'] = imbalance_ratio
+        
+        if imbalance_ratio > 5:  # More than 5:1 imbalance
+            validation_results['warnings'].append(f'Class imbalance detected: {imbalance_ratio:.1f}:1')
+    
+    # Check feature statistics
+    feature_cols = [col for col in df.columns if col not in ['Ticker', 'Label']]
+    if feature_cols:
+        feature_stats = df[feature_cols].describe()
+        validation_results['metrics']['feature_statistics'] = feature_stats.to_dict()
+    
+    print(f"[SUCCESS] Dataset validation complete")
+    print(f"[CHART] Total rows: {validation_results['total_rows']}")
+    print(f"[CHART] Total columns: {validation_results['total_columns']}")
+    print(f"[CHART] NaN count: {validation_results['metrics']['nan_count']}")
+    print(f"[CHART] Passed: {validation_results['passed']}")
+    
+    if validation_results['issues']:
+        print(f"[ERROR] Issues found:")
+        for issue in validation_results['issues']:
+            print(f"   - {issue}")
+    
+    if validation_results['warnings']:
+        print(f"[WARNING] Warnings:")
+        for warning in validation_results['warnings']:
+            print(f"   - {warning}")
+    
+    return validation_results
+
+
+def get_data_quality_report(csv_file: str) -> str:
+    """
+    Generate comprehensive data quality report
+    
+    Args:
+        csv_file: Path to dataset CSV
+        
+    Returns:
+        Formatted quality report
+    """
+    validation_results = validate_dataset_quality(csv_file)
+    
+    report = f"""
+[CHART] DATA QUALITY REPORT
+{'='*50}
+
+[CHART] Dataset Overview:
+   File: {csv_file}
+   Total Rows: {validation_results['total_rows']:,}
+   Total Columns: {validation_results['total_columns']}
+   Status: {'[SUCCESS] PASSED' if validation_results['passed'] else '[ERROR] FAILED'}
+
+[SEARCH] Quality Metrics:
+   NaN Values: {validation_results['metrics']['nan_count']:,}
+   NaN Ratio: {validation_results['metrics']['nan_ratio']:.2%}
+   Infinite Values: {validation_results['metrics']['inf_count']:,}
+   Extreme Values: {validation_results['metrics']['extreme_count']:,}
+
+"""
+    
+    if validation_results['issues']:
+        report += f"[ERROR] Issues Found:\n"
+        for issue in validation_results['issues']:
+            report += f"   • {issue}\n"
+    
+    if validation_results['warnings']:
+        report += f"[WARNING] Warnings:\n"
+        for warning in validation_results['warnings']:
+            report += f"   • {warning}\n"
+    
+    if 'class_distribution' in validation_results['metrics']:
+        report += f"\n[CHART] Class Distribution:\n"
+        for class_label, count in validation_results['metrics']['class_distribution'].items():
+            report += f"   Class {class_label}: {count:,} samples\n"
+    
+    report += f"\n{'='*50}\n"
+    
+    return report
 
 
 def download_stock_data(ticker, start_date, end_date):
@@ -149,24 +962,38 @@ def verify_data_quality(df, ticker):
     """
     Verify data quality and identify potential issues
     
+    🔧 ENHANCED WITH COMPREHENSIVE VALIDATION
+    - Uses validate_stock_data for systematic checks
+    - Adaptive period recommendations
+    - Detailed quality metrics and reporting
+    
     Args:
         df (pd.DataFrame): DataFrame to verify
         ticker (str): Ticker symbol for logging
     """
-    print(f"\n🔍 VERIFYING DATA QUALITY FOR {ticker}")
+    print(f"\n[SEARCH] VERIFYING DATA QUALITY FOR {ticker}")
     print("=" * 50)
     
+    # Use enhanced validation
+    validation_results = validate_stock_data(df, ticker, min_length=100)
+    
     # Check basic data
-    print(f"📊 Data shape: {df.shape}")
-    print(f"📊 Date range: {df['Date'].min()} to {df['Date'].max()}")
-    print(f"📊 Total days: {len(df)}")
+    print(f"[CHART] Data shape: {df.shape}")
+    print(f"[CHART] Date range: {df['Date'].min()} to {df['Date'].max()}")
+    print(f"[CHART] Total days: {len(df)}")
+    
+    # Display validation results
+    print(f"[CHART] Validation Status: {'[SUCCESS] PASSED' if validation_results['passed'] else '[ERROR] FAILED'}")
+    print(f"[CHART] Data Length: {validation_results['metrics']['data_length']}")
+    print(f"[CHART] Missing Ratio: {validation_results['metrics']['missing_ratio']:.2%}")
+    print(f"[CHART] Extreme Values: {validation_results['metrics']['extreme_values']}")
     
     # Check for missing values
     missing_data = df.isnull().sum()
-    print(f"📊 Missing values per column:")
+    print(f"[CHART] Missing values per column:")
     for col, missing in missing_data.items():
         if missing > 0:
-            print(f"  ⚠️  {col}: {missing} missing values")
+            print(f"  [WARNING] {col}: {missing} missing values")
     
     # Check price data quality
     price_issues = []
@@ -184,11 +1011,11 @@ def verify_data_quality(df, ticker):
                 price_issues.append(f"{col}: {extreme_values} extreme values")
     
     if price_issues:
-        print(f"⚠️  Price data issues:")
+        print(f"[WARNING] Price data issues:")
         for issue in price_issues:
             print(f"  {issue}")
     else:
-        print("✅ Price data looks good")
+        print("[SUCCESS] Price data looks good")
     
     # Check OHLC relationships
     if all(col in df.columns for col in ['High_raw', 'Low_raw', 'Open_raw', 'Close_raw']):
@@ -202,18 +1029,34 @@ def verify_data_quality(df, ticker):
                 invalid_ohlc += 1
         
         if invalid_ohlc > 0:
-            print(f"⚠️  OHLC relationship issues: {invalid_ohlc} invalid rows")
+            print(f"[WARNING] OHLC relationship issues: {invalid_ohlc} invalid rows")
         else:
-            print("✅ OHLC relationships are valid")
+            print("[SUCCESS] OHLC relationships are valid")
     
     # Check for sufficient data for patterns
-    if len(df) < 20:
-        print(f"⚠️  Insufficient data for pattern detection: {len(df)} days (need at least 20)")
+    data_length = len(df)
+    if data_length < 20:
+        print(f"[WARNING] Insufficient data for pattern detection: {data_length} days (need at least 20)")
     else:
-        print(f"✅ Sufficient data for pattern detection: {len(df)} days")
+        print(f"[SUCCESS] Sufficient data for pattern detection: {data_length} days")
+    
+    # Get adaptive periods recommendation
+    periods = get_adaptive_periods(data_length)
+    print(f"[TOOLS] Recommended adaptive periods for {data_length} data points:")
+    print(f"   [CHART] SMA/EMA: {periods['sma']}, {periods['ema']}")
+    print(f"   [CHART] RSI: {periods['rsi']}")
+    print(f"   [CHART] MACD: {periods['macd_fast']}, {periods['macd_slow']}")
+    print(f"   [CHART] Bollinger Bands: {periods['bb']}")
+    print(f"   [CHART] Stochastic: {periods['stoch']}")
+    
+    # Display validation issues if any
+    if validation_results['issues']:
+        print(f"\n[ERROR] Validation Issues:")
+        for issue in validation_results['issues']:
+            print(f"   • {issue}")
     
     # Sample data values
-    print(f"\n📊 Sample data values:")
+    print(f"\n[CHART] Sample data values:")
     for col in ['Open_raw', 'High_raw', 'Low_raw', 'Close_raw']:
         if col in df.columns:
             sample_values = df[col].head(3).values
@@ -227,6 +1070,11 @@ def calculate_swing_trading_features(df):
     Calculate features optimized for swing trading (1-3 days)
     Focuses on 1-day return prediction with swing trading indicators
     
+    🔧 ENHANCED WITH SAFE INDICATOR FUNCTIONS
+    - Prevents NaN propagation from insufficient data
+    - Uses adaptive periods based on data availability
+    - Comprehensive error handling and validation
+    
     Args:
         df (pd.DataFrame): DataFrame with explicit raw and adjusted columns
         
@@ -238,9 +1086,9 @@ def calculate_swing_trading_features(df):
     # Validate and clean data first
     df = validate_and_clean_data(df)
     
-    print("📈 Calculating swing trading features (1-3 day focus)...")
-    print(f"📊 Input data shape: {df.shape}")
-    print(f"📊 Data columns: {list(df.columns)}")
+    print("[CHART] Calculating swing trading features (1-3 day focus)...")
+    print(f"[CHART] Input data shape: {df.shape}")
+    print(f"[CHART] Data columns: {list(df.columns)}")
     
     # Convert to float64 for TA-Lib compatibility
     close_adj = df['Close_adj'].values.astype(np.float64)
@@ -248,23 +1096,38 @@ def calculate_swing_trading_features(df):
     low_adj = df['Low_adj'].values.astype(np.float64)
     volume_adj = df['Volume_adj'].values.astype(np.float64)
     
+    # Get adaptive periods based on data length
+    data_length = len(close_adj)
+    periods = get_adaptive_periods(data_length)
+    
+    print(f"[TOOLS] Using adaptive periods for {data_length} data points:")
+    print(f"   [CHART] Periods: {periods}")
+    
     # 1. TREND ANALYSIS (Swing traders focus on medium-term trends)
-    print("📊 Computing trend analysis...")
+    print("[CHART] Computing trend analysis with safe indicators...")
     trend_features = []
     
     try:
-        # Medium-term moving averages (swing traders use 10, 20, 50)
-        df['sma_10'] = talib.SMA(close_adj, timeperiod=10)
-        df['sma_20'] = talib.SMA(close_adj, timeperiod=20)
-        df['sma_50'] = talib.SMA(close_adj, timeperiod=50)
-        df['ema_10'] = talib.EMA(close_adj, timeperiod=10)
-        df['ema_20'] = talib.EMA(close_adj, timeperiod=20)
+        # Safe moving averages with adaptive periods
+        df['sma_10'] = safe_sma(close_adj, periods['sma'])
+        df['sma_20'] = safe_sma(close_adj, periods['sma'] * 2)
+        df['sma_50'] = safe_sma(close_adj, periods['sma'] * 5)
+        df['ema_10'] = safe_ema(close_adj, periods['ema'])
+        df['ema_20'] = safe_ema(close_adj, periods['ema'] * 2)
         
-        # Trend strength and position
-        df['trend_strength'] = (df['sma_20'] - df['sma_50']) / df['sma_50']
+        # Trend strength and position (with safe division)
+        df['trend_strength'] = np.where(
+            df['sma_50'] != 0,
+            (df['sma_20'] - df['sma_50']) / df['sma_50'],
+            np.nan
+        )
         df['above_sma_20'] = (df['Close_adj'] > df['sma_20']).astype(int)
         df['above_sma_50'] = (df['Close_adj'] > df['sma_50']).astype(int)
-        df['price_vs_ema_10'] = (df['Close_adj'] - df['ema_10']) / df['ema_10']
+        df['price_vs_ema_10'] = np.where(
+            df['ema_10'] != 0,
+            (df['Close_adj'] - df['ema_10']) / df['ema_10'],
+            np.nan
+        )
         
         # Golden/Death Cross signals (swing traders love these)
         df['golden_cross'] = (df['sma_10'] > df['sma_50']) & (df['sma_10'].shift(1) <= df['sma_50'].shift(1))
@@ -272,87 +1135,111 @@ def calculate_swing_trading_features(df):
         
         trend_features = ['sma_10', 'sma_20', 'sma_50', 'ema_10', 'ema_20', 'trend_strength', 
                         'above_sma_20', 'above_sma_50', 'price_vs_ema_10', 'golden_cross', 'death_cross']
-        print(f"✅ Trend features added: {len(trend_features)} features")
-        print(f"   📈 SMA periods: 10, 20, 50")
-        print(f"   📈 EMA periods: 10, 20")
-        print(f"   📈 Trend strength calculation: (SMA20 - SMA50) / SMA50")
-        print(f"   📈 Golden/Death cross detection")
+        print(f"[SUCCESS] Safe trend features added: {len(trend_features)} features")
+        print(f"   [CHART] Adaptive SMA periods: {periods['sma']}, {periods['sma']*2}, {periods['sma']*5}")
+        print(f"   [CHART] Adaptive EMA periods: {periods['ema']}, {periods['ema']*2}")
+        print(f"   [CHART] Safe trend strength calculation")
+        print(f"   [CHART] Golden/Death cross detection")
         
     except Exception as e:
-        print(f"⚠️  Error calculating trend indicators: {e}")
+        print(f"[WARNING] Error calculating trend indicators: {e}")
     
     # 2. MOMENTUM (Swing traders use longer periods)
-    print("⚡ Computing momentum indicators...")
+    print("[LIGHTNING] Computing momentum indicators with safe functions...")
     momentum_features = []
     
     try:
-        # RSI with swing trading focus
-        df['rsi_14'] = talib.RSI(close_adj, timeperiod=14)
-        df['rsi_oversold'] = (df['rsi_14'] < 30).astype(int)
-        df['rsi_overbought'] = (df['rsi_14'] > 70).astype(int)
-        df['rsi_neutral'] = ((df['rsi_14'] >= 30) & (df['rsi_14'] <= 70)).astype(int)
+        # Safe RSI with adaptive period
+        df['rsi'] = safe_rsi(close_adj, periods['rsi'])
+        df['rsi_oversold'] = (df['rsi'] < 30).astype(int)
+        df['rsi_overbought'] = (df['rsi'] > 70).astype(int)
+        df['rsi_neutral'] = ((df['rsi'] >= 30) & (df['rsi'] <= 70)).astype(int)
         
-        # MACD (swing traders use for trend confirmation)
-        macd, macd_signal, macd_hist = talib.MACD(close_adj)
+        # Safe MACD with adaptive periods
+        macd, macd_signal, macd_hist = safe_macd(close_adj, periods['macd_fast'], periods['macd_slow'])
         df['macd'] = macd
         df['macd_signal'] = macd_signal
         df['macd_histogram'] = macd_hist
         df['macd_bullish'] = (macd > macd_signal).astype(int)
         df['macd_bearish'] = (macd < macd_signal).astype(int)
         
-        # Stochastic (swing traders use for entry/exit)
-        stoch_k, stoch_d = talib.STOCH(high_adj, low_adj, close_adj)
+        # Safe Stochastic with adaptive periods
+        stoch_k, stoch_d = safe_stochastic(high_adj, low_adj, close_adj, periods['stoch'])
         df['stoch_k'] = stoch_k
         df['stoch_d'] = stoch_d
         df['stoch_oversold'] = (stoch_k < 20).astype(int)
         df['stoch_overbought'] = (stoch_k > 80).astype(int)
         
-        momentum_features = ['rsi_14', 'rsi_oversold', 'rsi_overbought', 'rsi_neutral',
+        # Additional momentum indicators
+        df['williams_r'] = safe_williams_r(high_adj, low_adj, close_adj, periods['williams_r'])
+        df['cci'] = safe_cci(high_adj, low_adj, close_adj, periods['cci'])
+        df['adx'] = safe_adx(high_adj, low_adj, close_adj, periods['adx'])
+        
+        momentum_features = ['rsi', 'rsi_oversold', 'rsi_overbought', 'rsi_neutral',
                            'macd', 'macd_signal', 'macd_histogram', 'macd_bullish', 'macd_bearish',
-                           'stoch_k', 'stoch_d', 'stoch_oversold', 'stoch_overbought']
-        print(f"✅ Momentum features added: {len(momentum_features)} features")
-        print(f"   ⚡ RSI: 14-period with oversold/overbought zones")
-        print(f"   ⚡ MACD: 12,26,9 with bullish/bearish signals")
-        print(f"   ⚡ Stochastic: 14,3 with oversold/overbought zones")
+                           'stoch_k', 'stoch_d', 'stoch_oversold', 'stoch_overbought',
+                           'williams_r', 'cci', 'adx']
+        print(f"[SUCCESS] Safe momentum features added: {len(momentum_features)} features")
+        print(f"   [LIGHTNING] Adaptive RSI: {periods['rsi']}-period with oversold/overbought zones")
+        print(f"   [LIGHTNING] Adaptive MACD: {periods['macd_fast']},{periods['macd_slow']},9 with bullish/bearish signals")
+        print(f"   [LIGHTNING] Adaptive Stochastic: {periods['stoch']},3 with oversold/overbought zones")
+        print(f"   [LIGHTNING] Additional: Williams %R, CCI, ADX")
         
     except Exception as e:
-        print(f"⚠️  Error calculating momentum indicators: {e}")
+        print(f"[WARNING] Error calculating momentum indicators: {e}")
     
     # 3. VOLATILITY (Swing traders focus on volatility for position sizing)
-    print("📊 Computing volatility analysis...")
+    print("[CHART] Computing volatility analysis with safe functions...")
     volatility_features = []
     
     try:
-        # ATR for volatility measurement
-        df['atr_14'] = talib.ATR(high_adj, low_adj, close_adj, timeperiod=14)
-        df['atr_high'] = (df['atr_14'] > df['atr_14'].rolling(20).mean() * 1.5).astype(int)
-        df['atr_low'] = (df['atr_14'] < df['atr_14'].rolling(20).mean() * 0.5).astype(int)
+        # Safe ATR for volatility measurement
+        df['atr'] = safe_atr(high_adj, low_adj, close_adj, periods['atr'])
         
-        # Bollinger Bands for volatility and mean reversion
-        bb_upper, bb_middle, bb_lower = talib.BBANDS(close_adj, timeperiod=20)
+        # Safe rolling mean for ATR comparison (with minimum periods)
+        atr_rolling_mean = df['atr'].rolling(min(20, len(df)//2), min_periods=1).mean()
+        df['atr_high'] = (df['atr'] > atr_rolling_mean * 1.5).astype(int)
+        df['atr_low'] = (df['atr'] < atr_rolling_mean * 0.5).astype(int)
+        
+        # Safe Bollinger Bands for volatility and mean reversion
+        bb_upper, bb_middle, bb_lower = safe_bollinger_bands(close_adj, periods['bb'])
         df['bb_upper'] = bb_upper
         df['bb_middle'] = bb_middle
         df['bb_lower'] = bb_lower
-        df['bb_position'] = (df['Close_adj'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-        df['bb_squeeze'] = ((df['bb_upper'] - df['bb_lower']) / df['bb_middle'] < 0.1).astype(int)
-        df['bb_expansion'] = ((df['bb_upper'] - df['bb_lower']) / df['bb_middle'] > 0.2).astype(int)
+        
+        # Safe BB position calculation
+        bb_range = df['bb_upper'] - df['bb_lower']
+        df['bb_position'] = np.where(
+            bb_range != 0,
+            (df['Close_adj'] - df['bb_lower']) / bb_range,
+            np.nan
+        )
+        
+        # Safe BB squeeze/expansion detection
+        bb_width = np.where(
+            df['bb_middle'] != 0,
+            (df['bb_upper'] - df['bb_lower']) / df['bb_middle'],
+            np.nan
+        )
+        df['bb_squeeze'] = (bb_width < 0.1).astype(int)
+        df['bb_expansion'] = (bb_width > 0.2).astype(int)
         
         # Price near Bollinger Bands (swing trading signals)
         df['near_bb_upper'] = (df['Close_adj'] > df['bb_upper'] * 0.98).astype(int)
         df['near_bb_lower'] = (df['Close_adj'] < df['bb_lower'] * 1.02).astype(int)
         
-        volatility_features = ['atr_14', 'atr_high', 'atr_low', 'bb_upper', 'bb_middle', 'bb_lower',
+        volatility_features = ['atr', 'atr_high', 'atr_low', 'bb_upper', 'bb_middle', 'bb_lower',
                              'bb_position', 'bb_squeeze', 'bb_expansion', 'near_bb_upper', 'near_bb_lower']
-        print(f"✅ Volatility features added: {len(volatility_features)} features")
-        print(f"   📊 ATR: 14-period with high/low volatility flags")
-        print(f"   📊 Bollinger Bands: 20-period with squeeze/expansion detection")
-        print(f"   📊 BB Position: Price position within bands")
+        print(f"[SUCCESS] Safe volatility features added: {len(volatility_features)} features")
+        print(f"   [CHART] Adaptive ATR: {periods['atr']}-period with high/low volatility flags")
+        print(f"   [CHART] Adaptive Bollinger Bands: {periods['bb']}-period with squeeze/expansion detection")
+        print(f"   [CHART] Safe BB Position: Price position within bands")
         
     except Exception as e:
-        print(f"⚠️  Error calculating volatility indicators: {e}")
+        print(f"[WARNING] Error calculating volatility indicators: {e}")
     
     # 4. SUPPORT/RESISTANCE (Swing traders focus on key levels)
-    print("🎯 Computing support/resistance levels...")
+    print("[TARGET] Computing support/resistance levels...")
     support_resistance_features = []
     
     try:
@@ -371,16 +1258,16 @@ def calculate_swing_trading_features(df):
         
         support_resistance_features = ['resistance_20', 'support_20', 'price_position', 'near_resistance', 
                                     'near_support', 'breakout_up', 'breakout_down']
-        print(f"✅ Support/Resistance features added: {len(support_resistance_features)} features")
-        print(f"   🎯 20-day resistance/support levels")
-        print(f"   🎯 Price position within range")
-        print(f"   🎯 Breakout detection (up/down)")
+        print(f"[SUCCESS] Support/Resistance features added: {len(support_resistance_features)} features")
+        print(f"   [TARGET] 20-day resistance/support levels")
+        print(f"   [TARGET] Price position within range")
+        print(f"   [TARGET] Breakout detection (up/down)")
         
     except Exception as e:
-        print(f"⚠️  Error calculating support/resistance: {e}")
+        print(f"[WARNING] Error calculating support/resistance: {e}")
     
     # 5. VOLUME (Swing traders use volume for confirmation)
-    print("📊 Computing volume analysis...")
+    print("[CHART] Computing volume analysis...")
     volume_features = []
     
     try:
@@ -400,17 +1287,17 @@ def calculate_swing_trading_features(df):
         
         volume_features = ['volume_sma_20', 'volume_ratio', 'high_volume', 'low_volume', 'obv', 'mfi', 
                          'mfi_oversold', 'mfi_overbought']
-        print(f"✅ Volume features added: {len(volume_features)} features")
-        print(f"   📊 Volume SMA: 20-period average")
-        print(f"   📊 Volume ratio: Current vs 20-day average")
-        print(f"   📊 OBV: On Balance Volume for trend confirmation")
-        print(f"   📊 MFI: Money Flow Index (14-period)")
+        print(f"[SUCCESS] Volume features added: {len(volume_features)} features")
+        print(f"   [CHART] Volume SMA: 20-period average")
+        print(f"   [CHART] Volume ratio: Current vs 20-day average")
+        print(f"   [CHART] OBV: On Balance Volume for trend confirmation")
+        print(f"   [CHART] MFI: Money Flow Index (14-period)")
         
     except Exception as e:
         print(f"⚠️  Error calculating volume indicators: {e}")
     
     # 6. PRICE ACTION (Swing traders focus on multi-day patterns)
-    print("💹 Computing price action features...")
+    print("[CHART] Computing price action features...")
     price_action_features = []
     
     # Returns (swing traders focus on 1-3 day moves)
@@ -435,14 +1322,15 @@ def calculate_swing_trading_features(df):
     
     price_action_features = ['daily_return', 'return_3d', 'return_5d', 'gap', 'gap_up', 'gap_down',
                            'hl_ratio', 'oc_ratio', 'higher_high', 'lower_low', 'higher_low', 'lower_high']
-    print(f"✅ Price action features added: {len(price_action_features)} features")
-    print(f"   💹 Returns: 1-day, 3-day, 5-day")
-    print(f"   💹 Gap analysis: Up/down gap detection")
-    print(f"   💹 Price relationships: High-low, Open-close ratios")
-    print(f"   💹 Swing patterns: Higher highs/lows, Lower highs/lows")
+    
+    print(f"[SUCCESS] Price action features added: {len(price_action_features)} features")
+    print(f"   [CHART] Returns: 1-day, 3-day, 5-day")
+    print(f"   [CHART] Gap analysis: Up/down gap detection")
+    print(f"   [CHART] Price relationships: High-low, Open-close ratios")
+    print(f"   [CHART] Swing patterns: Higher highs/lows, Lower highs/lows")
     
     # 7. CANDLESTICK PATTERNS (Debug this section)
-    print("🕯️ Computing candlestick patterns...")
+    print("[PATTERN] Computing candlestick patterns...")
     pattern_features = []
     
     try:
@@ -458,7 +1346,7 @@ def calculate_swing_trading_features(df):
         low_raw = df['Low_raw'].values.astype(np.float64)
         close_raw = df['Close_raw'].values.astype(np.float64)
         
-        print(f"🕯️ Raw data sample - Open: {open_raw[:5]}, High: {high_raw[:5]}, Low: {low_raw[:5]}, Close: {close_raw[:5]}")
+        print(f"[PATTERN] Raw data sample - Open: {open_raw[:5]}, High: {high_raw[:5]}, Low: {low_raw[:5]}, Close: {close_raw[:5]}")
         
         for pattern in key_patterns:
             try:
@@ -468,16 +1356,16 @@ def calculate_swing_trading_features(df):
                 # Convert numpy array to pandas series and then to boolean
                 df[f'pattern_{pattern}'] = (pattern_result != 0).astype(int)
                 pattern_count = df[f'pattern_{pattern}'].sum()
-                print(f"🕯️ {pattern}: {pattern_count} patterns found")
+                print(f"[PATTERN] {pattern}: {pattern_count} patterns found")
                 pattern_features.append(f'pattern_{pattern}')
             except Exception as e:
                 print(f"⚠️  Error calculating {pattern}: {e}")
                 df[f'pattern_{pattern}'] = 0
                 pattern_features.append(f'pattern_{pattern}')
         
-        print(f"✅ Candlestick patterns added: {len(pattern_features)} features")
-        print(f"   🕯️ 10 key patterns for swing trading")
-        print(f"   🕯️ Calculated from raw OHLC data")
+        print(f"[SUCCESS] Candlestick patterns added: {len(pattern_features)} features")
+        print(f"   [PATTERN] 10 key patterns for swing trading")
+        print(f"   [PATTERN] Calculated from raw OHLC data")
         
     except Exception as e:
         print(f"⚠️  Error calculating candlestick patterns: {e}")
@@ -487,18 +1375,18 @@ def calculate_swing_trading_features(df):
                    len(support_resistance_features) + len(volume_features) + len(price_action_features) + \
                    len(pattern_features)
     
-    print(f"\n📊 FEATURE SUMMARY:")
-    print(f"📈 Trend features: {len(trend_features)}")
-    print(f"⚡ Momentum features: {len(momentum_features)}")
-    print(f"📊 Volatility features: {len(volatility_features)}")
-    print(f"🎯 Support/Resistance features: {len(support_resistance_features)}")
-    print(f"📊 Volume features: {len(volume_features)}")
-    print(f"💹 Price action features: {len(price_action_features)}")
-    print(f"🕯️ Candlestick patterns: {len(pattern_features)}")
-    print(f"📊 TOTAL FEATURES: {total_features}")
-    print(f"📊 Final data shape: {df.shape}")
+    print(f"\n[CHART] FEATURE SUMMARY:")
+    print(f"[TREND] Trend features: {len(trend_features)}")
+    print(f"[MOMENTUM] Momentum features: {len(momentum_features)}")
+    print(f"[VOLATILITY] Volatility features: {len(volatility_features)}")
+    print(f"[SUPPORT] Support/Resistance features: {len(support_resistance_features)}")
+    print(f"[VOLUME] Volume features: {len(volume_features)}")
+    print(f"[PRICE] Price action features: {len(price_action_features)}")
+    print(f"[PATTERN] Candlestick patterns: {len(pattern_features)}")
+    print(f"[TOTAL] TOTAL FEATURES: {total_features}")
+    print(f"[SHAPE] Final data shape: {df.shape}")
     
-    print(f"✅ Swing trading features complete. Total features: {len(df.columns)}")
+    print(f"[SUCCESS] Swing trading features complete. Total features: {len(df.columns)}")
     return df
 
 
@@ -520,12 +1408,24 @@ def calculate_all_features(df):
     return calculate_swing_trading_features(df)
 
 
-def build_dataset(csv_output=None):
+def build_dataset(csv_output=None, apply_quality_fixes=True, nan_strategy='auto', 
+                 extreme_method='isolation_forest', balance_method='smote'):
     """
     Build the dataset using explicit raw/adjusted column families (Professional Pipeline)
     
+    🔧 ENHANCED WITH COMPREHENSIVE VALIDATION AND QUALITY IMPROVEMENTS
+    - Safe indicator functions prevent NaN propagation
+    - Adaptive periods based on data availability
+    - Dataset quality validation and reporting
+    - Graceful handling of insufficient data
+    - Automatic data quality improvements (optional)
+    
     Args:
         csv_output (str, optional): Output CSV file path
+        apply_quality_fixes (bool): Whether to apply quality improvements (default: True)
+        nan_strategy (str): NaN handling strategy ('auto', 'drop', 'fill_mean', 'fill_median', 'interpolate')
+        extreme_method (str): Extreme value handling method ('isolation_forest', 'iqr', 'zscore', 'winsorize')
+        balance_method (str): Class balancing method ('smote', 'undersample', 'oversample', 'class_weights')
     
     Returns:
         str: Path to the created CSV file
@@ -536,6 +1436,14 @@ def build_dataset(csv_output=None):
     print(f"Building professional dataset from {N_TICKERS} tickers...")
     print(f"Date range: {START} to {END}")
     print("Using explicit raw/adjusted column families")
+    print("🔧 Enhanced with safe indicator functions and validation")
+    if apply_quality_fixes:
+        print("🔧 Quality improvements: ENABLED")
+        print(f"   - NaN strategy: {nan_strategy}")
+        print(f"   - Extreme value method: {extreme_method}")
+        print(f"   - Class balancing: {balance_method}")
+    else:
+        print("🔧 Quality improvements: DISABLED")
     
     # Get S&P 500 tickers
     tickers = pd.read_csv(TICKERS_CSV)["Symbol"].tolist()[:N_TICKERS]
@@ -626,9 +1534,40 @@ def build_dataset(csv_output=None):
     print(f"Label distribution:")
     print(df_final['Label'].value_counts().sort_index())
     
-    # Save dataset
-    df_final.to_csv(csv_output, index=False)
-    print(f"Dataset saved to: {csv_output}")
+    # Apply quality improvements if enabled
+    if apply_quality_fixes:
+        print(f"\n[ROCKET] Applying data quality improvements...")
+        print(f"[CHART] Original dataset shape: {df_final.shape}")
+        
+        # Store original for comparison
+        df_original = df_final.copy()
+        
+        # Apply quality improvement pipeline
+        df_final = apply_data_quality_pipeline(
+            df_final,
+            nan_strategy=nan_strategy,
+            extreme_method=extreme_method,
+            balance_method=balance_method,
+            target_col='Label'
+        )
+        
+        print(f"[CHART] Cleaned dataset shape: {df_final.shape}")
+        
+        # Save quality improvement report
+        quality_report_path = csv_output.replace('.csv', '_quality_improvement_report.txt')
+        save_quality_report(df_original, df_final, quality_report_path)
+        
+        # Create cleaned dataset filename
+        cleaned_csv_output = csv_output.replace('.csv', '_cleaned.csv')
+        print(f"[SAVE] Saving cleaned dataset to: {cleaned_csv_output}")
+        df_final.to_csv(cleaned_csv_output, index=False)
+        
+        # Use cleaned dataset for further processing
+        csv_output = cleaned_csv_output
+    else:
+        # Save original dataset
+        df_final.to_csv(csv_output, index=False)
+        print(f"Dataset saved to: {csv_output}")
     
     # Create detailed feature summary
     summary_file = csv_output.replace('.csv', '_feature_summary.txt')
@@ -671,6 +1610,27 @@ def build_dataset(csv_output=None):
     
     print(f"Feature summary saved to: {summary_file}")
     
+    # 🔧 ENHANCED: Validate final dataset quality
+    print(f"\n🔍 Validating final dataset quality...")
+    validation_results = validate_dataset_quality(csv_output)
+    
+    if validation_results['passed']:
+        print(f"[SUCCESS] Dataset validation PASSED")
+        print(f"[CHART] Final dataset: {validation_results['total_rows']:,} samples")
+        print(f"[CHART] Features per sample: {validation_results['total_columns'] - 2}")  # Exclude Ticker and Label
+    else:
+        print(f"❌ Dataset validation FAILED")
+        print(f"⚠️  Issues found:")
+        for issue in validation_results['issues']:
+            print(f"   - {issue}")
+    
+    # Generate quality report
+    quality_report = get_data_quality_report(csv_output)
+    report_file = csv_output.replace('.csv', '_quality_report.txt')
+    with open(report_file, 'w') as f:
+        f.write(quality_report)
+    print(f"[CHART] Quality report saved to: {report_file}")
+    
     return csv_output
 
 
@@ -692,7 +1652,8 @@ def build_dataset_incremental(csv_output=None, save_interval=100):
     
     print(f"Building professional dataset incrementally from {N_TICKERS} tickers...")
     print(f"Date range: {START} to {END}")
-    print(f"Saving data every {save_interval} tickers")
+    print(f"Sequence length: {SEQ_LEN} days (1-day swing trading optimized)")
+    print(f"Saving data every {save_interval} tickers (backup only)")
     print("Press Ctrl+C to stop gracefully and save collected data")
     print("Using explicit raw/adjusted column families")
     
@@ -703,8 +1664,10 @@ def build_dataset_incremental(csv_output=None, save_interval=100):
     needed_length = SEQ_LEN + HORIZON + 1
     feature_columns = None  # Will be set from first successful ticker
     
-    # Create backup file path
-    backup_file = csv_output.replace('.csv', '_backup.csv')
+    # Create backup file path with date
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_file = csv_output.replace('.csv', f'_backup_{timestamp}.csv')
     
     for i, ticker in enumerate(tickers):
         # Check for graceful shutdown
@@ -776,10 +1739,11 @@ def build_dataset_incremental(csv_output=None, save_interval=100):
             # Add ticker rows to all rows
             all_rows.extend(ticker_rows)
             
-            # Save incrementally every save_interval tickers
-            if (i + 1) % save_interval == 0:
-                print(f"\n💾 Saving intermediate data after {i+1} tickers ({len(all_rows)} samples)...")
-                _save_incremental_data(all_rows, feature_columns, backup_file, i+1)
+            # Save incrementally every save_interval tickers (but not the last batch)
+            if (i + 1) % save_interval == 0 and (i + 1) < len(tickers):
+                print(f"\n[BACKUP] Saving intermediate backup after {i+1} tickers ({len(all_rows)} samples)...")
+                backup_path = csv_output.replace('.csv', f'_backup_{i+1}.csv')
+                _save_incremental_data(all_rows, feature_columns, backup_path, i+1)
                 
         except Exception as e:
             print(f"Error processing {ticker}: {e}")
@@ -792,12 +1756,15 @@ def build_dataset_incremental(csv_output=None, save_interval=100):
     print(f"\n💾 Saving final dataset with {len(all_rows)} samples...")
     final_path = _save_incremental_data(all_rows, feature_columns, csv_output, len(tickers))
     
-    # Create detailed feature summary
+    # Clean up old backups
+    _cleanup_old_backups(csv_output, keep_recent=3)
+    
+    # Create feature summary
     summary_file = csv_output.replace('.csv', '_feature_summary.txt')
     _create_feature_summary(summary_file, feature_columns, len(all_rows))
     
-    print(f"✅ Dataset saved to: {final_path}")
-    print(f"📊 Total samples collected: {len(all_rows)}")
+    print(f"[SUCCESS] Dataset saved to: {final_path}")
+    print(f"[CHART] Total samples collected: {len(all_rows)}")
     
     return final_path
 
@@ -857,7 +1824,8 @@ def _create_feature_summary(summary_file, feature_columns, total_samples):
         f.write("- Candlestick patterns: Calculated on raw OHLC (traditional visual analysis)\n")
         f.write("- Technical indicators: Calculated on adjusted OHLC (economic accuracy)\n")
         f.write("- Returns & volatility: Calculated on adjusted data (essential for modeling)\n")
-        f.write("- Price labels: Based on adjusted close (real economic returns)\n\n")
+        f.write("- Price labels: Based on adjusted close (real economic returns)\n")
+        f.write("- Sequence length: 5 days (optimized for 1-day swing trading)\n\n")
         
         # Categorize features by source
         raw_features = [f for f in feature_columns if f.endswith('_raw')]
@@ -886,6 +1854,64 @@ def _create_feature_summary(summary_file, feature_columns, total_samples):
     print(f"Feature summary saved to: {summary_file}")
 
 
+def _cleanup_old_backups(csv_output, keep_recent=3):
+    """
+    Clean up old backup files, keeping only the most recent ones
+    
+    Args:
+        csv_output (str): Main CSV file path
+        keep_recent (int): Number of recent backups to keep
+    """
+    import glob
+    import os
+    
+    # Find all backup files
+    backup_pattern = csv_output.replace('.csv', '_backup_*.csv')
+    backup_files = glob.glob(backup_pattern)
+    
+    if len(backup_files) > keep_recent:
+        # Sort by modification time (newest first)
+        backup_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        
+        # Remove old backups
+        for old_backup in backup_files[keep_recent:]:
+            try:
+                os.remove(old_backup)
+                print(f"🗑️ Removed old backup: {os.path.basename(old_backup)}")
+            except Exception as e:
+                print(f"⚠️ Could not remove old backup {old_backup}: {e}")
+
+
+def _find_latest_backup(csv_output):
+    """
+    Find the most recent backup file
+    
+    Args:
+        csv_output (str): Main CSV file path
+    
+    Returns:
+        str: Path to latest backup file, or None if not found
+    """
+    import glob
+    import os
+    
+    # Check for dated backups first
+    backup_pattern = csv_output.replace('.csv', '_backup_*.csv')
+    backup_files = glob.glob(backup_pattern)
+    
+    if backup_files:
+        # Return the most recent backup
+        latest_backup = max(backup_files, key=lambda x: os.path.getmtime(x))
+        return latest_backup
+    
+    # Check for old-style backup
+    old_backup = csv_output.replace('.csv', '_backup.csv')
+    if os.path.exists(old_backup):
+        return old_backup
+    
+    return None
+
+
 def build_dataset_smart_update(csv_output=None, days_back=30):
     """
     Smart dataset update that only collects recent data for new tickers and updates existing ones
@@ -911,17 +1937,17 @@ def build_dataset_smart_update(csv_output=None, days_back=30):
         print(f"📁 Found existing dataset: {csv_output}")
         existing_data = pd.read_csv(csv_output)
         existing_tickers = set(existing_data['Ticker'].unique())
-        print(f"📊 Existing dataset has {len(existing_tickers)} tickers and {len(existing_data)} samples")
-    elif os.path.exists(csv_output.replace('.csv', '_backup.csv')):
-        backup_file = csv_output.replace('.csv', '_backup.csv')
+        print(f"[CHART] Existing dataset has {len(existing_tickers)} tickers and {len(existing_data)} samples")
+    elif _find_latest_backup(csv_output):
+        backup_file = _find_latest_backup(csv_output)
         print(f"📁 Found backup dataset: {backup_file}")
         existing_data = pd.read_csv(backup_file)
         existing_tickers = set(existing_data['Ticker'].unique())
-        print(f"📊 Backup dataset has {len(existing_tickers)} tickers and {len(existing_data)} samples")
+        print(f"[CHART] Backup dataset has {len(existing_tickers)} tickers and {len(existing_data)} samples")
         # Move backup to main file
         import shutil
         shutil.move(backup_file, csv_output)
-        print(f"✅ Moved backup to main dataset: {csv_output}")
+        print(f"[SUCCESS] Moved backup to main dataset: {csv_output}")
     else:
         print("📁 No existing dataset found - will create new one")
     
@@ -933,7 +1959,7 @@ def build_dataset_smart_update(csv_output=None, days_back=30):
     new_tickers = current_tickers - existing_tickers
     removed_tickers = existing_tickers - current_tickers
     
-    print(f"\n📈 Ticker Analysis:")
+    print(f"\n[ANALYSIS] Ticker Analysis:")
     print(f"  - Current S&P 500 tickers: {len(current_tickers)}")
     print(f"  - Existing dataset tickers: {len(existing_tickers)}")
     print(f"  - New tickers to add: {len(new_tickers)}")
@@ -1084,7 +2110,7 @@ def build_dataset_smart_update(csv_output=None, days_back=30):
     print(final_df['Label'].value_counts().sort_index())
     
     final_df.to_csv(csv_output, index=False)
-    print(f"✅ Updated dataset saved to: {csv_output}")
+    print(f"[SUCCESS] Updated dataset saved to: {csv_output}")
     
     # Create feature summary
     summary_file = csv_output.replace('.csv', '_feature_summary.txt')
@@ -1224,3 +2250,77 @@ def compare_adjusted_vs_raw_analysis(ticker="AAPL", days=252):
     print(f"  Return correlation: {analysis['return_correlation']:.4f}")
     
     return analysis 
+
+
+if __name__ == "__main__":
+    """
+    Main execution with command-line argument support for quality improvements
+    """
+    parser = argparse.ArgumentParser(description='Build financial dataset with optional quality improvements')
+    parser.add_argument('--output', type=str, default=None, help='Output CSV file path')
+    parser.add_argument('--skip-quality-fixes', action='store_true', 
+                       help='Skip data quality improvements (default: enabled)')
+    parser.add_argument('--nan-strategy', type=str, default='auto',
+                       choices=['auto', 'drop', 'fill_mean', 'fill_median', 'interpolate'],
+                       help='NaN handling strategy (default: auto)')
+    parser.add_argument('--extreme-method', type=str, default='isolation_forest',
+                       choices=['isolation_forest', 'iqr', 'zscore', 'winsorize'],
+                       help='Extreme value handling method (default: isolation_forest)')
+    parser.add_argument('--balance-method', type=str, default='smote',
+                       choices=['smote', 'undersample', 'oversample', 'class_weights'],
+                       help='Class balancing method (default: smote)')
+    parser.add_argument('--incremental', action='store_true',
+                       help='Use incremental dataset building')
+    parser.add_argument('--smart-update', action='store_true',
+                       help='Use smart update dataset building')
+    parser.add_argument('--days-back', type=int, default=30,
+                       help='Days back for smart update (default: 30)')
+    parser.add_argument('--save-interval', type=int, default=100,
+                       help='Save interval for incremental building (default: 100)')
+    
+    args = parser.parse_args()
+    
+    # Determine quality fixes setting
+    apply_quality_fixes = not args.skip_quality_fixes
+    
+    print("=" * 60)
+    print("FINANCIAL DATASET BUILDER WITH QUALITY IMPROVEMENTS")
+    print("=" * 60)
+    
+    try:
+        if args.incremental:
+            print("[INFO] Using incremental dataset building...")
+            result = build_dataset_incremental(
+                csv_output=args.output,
+                save_interval=args.save_interval
+            )
+        elif args.smart_update:
+            print("[INFO] Using smart update dataset building...")
+            result = build_dataset_smart_update(
+                csv_output=args.output,
+                days_back=args.days_back
+            )
+        else:
+            print("[INFO] Using standard dataset building...")
+            result = build_dataset(
+                csv_output=args.output,
+                apply_quality_fixes=apply_quality_fixes,
+                nan_strategy=args.nan_strategy,
+                extreme_method=args.extreme_method,
+                balance_method=args.balance_method
+            )
+        
+        print(f"\n[SUCCESS] Dataset building completed!")
+        print(f"[CHART] Output file: {result}")
+        
+        if apply_quality_fixes:
+            print(f"[INFO] Quality improvements were applied")
+            print(f"[INFO] Check the quality improvement report for details")
+        else:
+            print(f"[INFO] Quality improvements were skipped")
+        
+    except KeyboardInterrupt:
+        print(f"\n[WARNING] Process interrupted by user")
+    except Exception as e:
+        print(f"\n[ERROR] Dataset building failed: {e}")
+        sys.exit(1)

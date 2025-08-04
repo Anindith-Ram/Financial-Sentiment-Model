@@ -42,6 +42,14 @@ def main():
                        help='Days of recent data to collect for updates (default: 30)')
     parser.add_argument('--portfolio', type=str, nargs='+', default=['AAPL', 'MSFT', 'GOOGL'],
                        help='List of tickers for portfolio signals')
+    parser.add_argument('--progressive', action='store_true',
+                       help='Use progressive training mode')
+    parser.add_argument('--enable-logging', action='store_true',
+                       help='Enable enhanced logging')
+    parser.add_argument('--experiment-name', type=str, default=None,
+                       help='Name for the experiment')
+    parser.add_argument('--balance-classes', action='store_true',
+                       help='Balance class distribution during training')
     
     args = parser.parse_args()
     
@@ -51,19 +59,19 @@ def main():
     
     # Handle adjusted close comparison
     if args.compare_adjustment:
-        print("\n📊 Comparing Raw vs Adjusted Close Analysis...")
+        print("\n[CHART] Comparing Raw vs Adjusted Close Analysis...")
         print("-" * 40)
         try:
             analysis = compare_adjusted_vs_raw_analysis("AAPL", days=252)
             if analysis:
-                print("✅ Comparison completed successfully!")
+                print("[SUCCESS] Comparison completed successfully!")
             return
         except Exception as e:
             print(f"❌ Error in comparison: {e}")
             return
 
     if args.mode == 'data' or args.mode == 'all':
-        print("\n📊 Building professional dataset...")
+        print("\n[CHART] Building professional dataset...")
         print("-" * 40)
         print("Using explicit raw/adjusted column families for maximum accuracy")
         
@@ -79,7 +87,7 @@ def main():
                 dataset_path = build_dataset_smart_update(args.data_file, args.days_back)
             else:
                 dataset_path = build_dataset(args.data_file)
-            print(f"✅ Professional dataset created successfully: {dataset_path}")
+            print(f"[SUCCESS] Professional dataset created successfully: {dataset_path}")
         except Exception as e:
             print(f"❌ Error building dataset: {e}")
             if args.mode != 'all':
@@ -94,9 +102,31 @@ def main():
                 print("Please run with --mode data first")
                 return
             
-            trainer = Trainer(csv_file=args.data_file, model_save_path=args.model_file)
-            best_accuracy = trainer.train(epochs=args.epochs)
-            print(f"✅ Training completed! Best accuracy: {best_accuracy:.4f}")
+            # Handle progressive training and enhanced logging
+            enable_logging = args.enable_logging
+            experiment_name = args.experiment_name
+            balance_classes = args.balance_classes
+            
+            if args.progressive:
+                print("[PROGRESSIVE] Using progressive training mode")
+                if enable_logging:
+                    print("[LOGGING] Enhanced logging enabled")
+                if experiment_name:
+                    print(f"[EXPERIMENT] Experiment name: {experiment_name}")
+                if balance_classes:
+                    print("[BALANCE] Class balancing enabled")
+                
+                # Use progressive trainer
+                from src.training.progressive_trainer import run_progressive_training
+                print("[INFO] Progressive training function called without parameters")
+                results = run_progressive_training()
+                best_accuracy = results.get('stage2', {}).get('best_val_acc', 0.0)
+            else:
+                # Use standard trainer
+                trainer = Trainer(csv_file=args.data_file, model_save_path=args.model_file)
+                best_accuracy = trainer.train(epochs=args.epochs)
+            
+            print(f"[SUCCESS] Training completed! Best accuracy: {best_accuracy:.4f}")
             
         except Exception as e:
             print(f"❌ Error during training: {e}")
@@ -118,7 +148,7 @@ def main():
             if 'error' in result:
                 print(f"❌ Error predicting {args.ticker}: {result['error']}")
             else:
-                print(f"📈 Prediction for {args.ticker}:")
+                print(f"[PREDICT] Prediction for {args.ticker}:")
                 print(f"   Prediction: {result['prediction']}")
                 print(f"   Confidence: {result['confidence']:.2%}")
         except Exception as e:
@@ -127,7 +157,7 @@ def main():
                 return
     
     if args.mode == 'signals':
-        print(f"\n🎯 Generating trading signals for portfolio...")
+        print(f"\n[SIGNAL] Generating trading signals for portfolio...")
         print("-" * 40)
         try:
             if not os.path.exists(args.model_file):
@@ -137,7 +167,7 @@ def main():
             
             generator = TradingSignalGenerator(args.model_file)
             
-            print(f"📊 Analyzing {len(args.portfolio)} stocks: {', '.join(args.portfolio)}")
+            print(f"[CHART] Analyzing {len(args.portfolio)} stocks: {', '.join(args.portfolio)}")
             signals = generator.get_portfolio_signals(args.portfolio)
             
             # Print summary
@@ -157,7 +187,7 @@ def main():
                 return
     
     if args.mode == 'demo' or args.mode == 'all':
-        print("\n🎯 Running prediction demo...")
+        print("\n[DEMO] Running prediction demo...")
         print("-" * 40)
         try:
             if not os.path.exists(args.model_file):
@@ -166,7 +196,7 @@ def main():
                 return
             
             demo_prediction()
-            print("✅ Demo completed successfully!")
+            print("[SUCCESS] Demo completed successfully!")
             
         except Exception as e:
             print(f"❌ Error during demo: {e}")

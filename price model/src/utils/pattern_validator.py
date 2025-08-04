@@ -184,7 +184,7 @@ def create_pattern_summary_report(analysis_results):
     Returns:
         str: Formatted report
     """
-    report = ["📊 Candlestick Pattern Analysis Report", "=" * 50]
+            report = ["[CHART] Candlestick Pattern Analysis Report", "=" * 50]
     
     # Sort patterns by frequency
     sorted_patterns = sorted(
@@ -236,7 +236,7 @@ def test_pattern_detection(ticker="AAPL", days=100):
         print("\n" + report)
         
         # Show multi-day pattern verification
-        print(f"\n🔍 Multi-day Pattern Verification for {ticker}:")
+        print(f"\n[SEARCH] Multi-day Pattern Verification for {ticker}:")
         for pattern, info in verification['multi_day_patterns_found'].items():
             print(f"  {pattern}: {info['occurrences']} occurrences "
                   f"({info['days_required']} days required)")
@@ -244,7 +244,7 @@ def test_pattern_detection(ticker="AAPL", days=100):
         return df_with_patterns, analysis, verification
         
     except Exception as e:
-        print(f"❌ Error testing pattern detection: {e}")
+        print(f"[ERROR] Error testing pattern detection: {e}")
         return None, None, None
 
 

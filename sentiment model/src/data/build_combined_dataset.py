@@ -381,8 +381,8 @@ def main():
     # Save result
     output_path = save_combined_dataset(combined_df, args.out_dir)
     
-    print(f"\n✅ Combined dataset creation complete!")
-    print(f"📊 Total records: {len(combined_df)}")
+            print(f"\n[SUCCESS] Combined dataset creation complete!")
+        print(f"[CHART] Total records: {len(combined_df)}")
     print(f"📁 Output: {output_path}")
 
 

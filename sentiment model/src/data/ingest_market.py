@@ -59,7 +59,7 @@ def fetch_market_data(ticker: str, start: str, end: str) -> dict:
     data = _fetch_yfinance_metrics(ticker)
     missing = len([v for v in data.values() if v is None])
     if missing:
-        print(f'⚠️  {ticker}: {missing}/{len(data)} metrics missing for {start}–{end}')
+                        print(f'[WARNING] {ticker}: {missing}/{len(data)} metrics missing for {start}–{end}')
     return data
 
 def main():

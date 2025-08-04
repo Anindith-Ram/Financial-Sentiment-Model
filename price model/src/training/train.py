@@ -11,6 +11,7 @@ import sys
 import argparse
 from datetime import datetime
 import warnings
+from tqdm import tqdm
 
 # Add logs directory to path for enhanced logging
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'logs'))
@@ -44,14 +45,14 @@ try:
     ENHANCED_LOGGING_AVAILABLE = True
 except ImportError:
     ENHANCED_LOGGING_AVAILABLE = False
-    print("⚠️  Enhanced logging not available. Install training_logs.py in logs/ directory.")
+    print("[WARNING] Enhanced logging not available. Install training_logs.py in logs/ directory.")
 
 try:
     from src.training.progressive_trainer import ProgressiveTrainer, run_progressive_training
     PROGRESSIVE_TRAINING_AVAILABLE = True
 except ImportError:
     PROGRESSIVE_TRAINING_AVAILABLE = False
-    print("⚠️  Progressive training not available. Install progressive_trainer.py in src/training/ directory.")
+    print("[WARNING] Progressive training not available. Install progressive_trainer.py in src/training/ directory.")
 
 
 class EnhancedAdvancedTrainer:
@@ -76,11 +77,11 @@ class EnhancedAdvancedTrainer:
         self.enable_logging = enable_logging and ENHANCED_LOGGING_AVAILABLE
         self.experiment_name = experiment_name or f"swing_trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        print("🚀 Initializing Swing Trading Training Pipeline...")
+        print("[ROCKET] Initializing Swing Trading Training Pipeline...")
         print("=" * 60)
-        print("📈 Focus: 1-3 day return predictions")
-        print("🎯 Target: Swing trading signals (1-day horizon)")
-        print("📊 Features: 35 swing trading optimized indicators")
+        print("[CHART] Focus: 1-day return predictions")
+        print("[TARGET] Target: Immediate swing trading signals (1-day horizon)")
+        print("[CHART] Features: 35 swing trading optimized indicators")
         
         # Initialize data loaders
         self.data_loader = CandlestickDataLoader(
@@ -94,7 +95,7 @@ class EnhancedAdvancedTrainer:
         
         # Initialize model optimized for swing trading
         features_per_day = self.data_loader.get_feature_dim()
-        print(f"📊 Model Configuration:")
+        print(f"[CHART] Model Configuration:")
         print(f"   Features per day: {features_per_day}")
         print(f"   Sequence length: {SEQ_LEN} days")
         print(f"   Prediction horizon: 1 day")
@@ -110,7 +111,7 @@ class EnhancedAdvancedTrainer:
         # Initialize enhanced logging
         if self.enable_logging:
             self.logger = create_training_logger(self.experiment_name)
-            print(f"📊 Enhanced logging enabled: {self.experiment_name}")
+            print(f"[CHART] Enhanced logging enabled: {self.experiment_name}")
             
             # Log data quality
             feature_names = self.data_loader.get_feature_names()
@@ -200,21 +201,33 @@ class EnhancedAdvancedTrainer:
     
     def _print_training_config(self):
         """Print training configuration optimized for swing trading"""
-        print("\n📊 SWING TRADING TRAINING CONFIGURATION:")
+        print("\n[CHART] SWING TRADING TRAINING CONFIGURATION:")
         print("=" * 50)
-        print(f"🎯 Prediction Target: 1-day returns")
-        print(f"📈 Sequence Length: {SEQ_LEN} days (swing trading lookback)")
-        print(f"📊 Features per day: {self.data_loader.get_feature_dim()}")
-        print(f"🔄 Batch Size: {BATCH_SIZE}")
-        print(f"📚 Learning Rate: {LEARNING_RATE}")
-        print(f"⏱️  Epochs: {EPOCHS}")
-        print(f"🎯 Early Stopping: {PATIENCE} epochs patience")
-        print(f"📊 Train/Val Split: 85/15 (swing trading optimized)")
-        print(f"⚡ Optimizer: {OPTIMIZER}")
-        print(f"📈 Loss Function: {LOSS_FUNCTION}")
-        print(f"🎯 Class Weights: Enabled for imbalanced swing signals")
-        print(f"📊 Mixed Precision: {MIXED_PRECISION}")
-        print(f"🔄 Gradient Clipping: {MAX_GRAD_NORM}")
+        print(f"[TARGET] Prediction Target: 1-day returns")
+        print(f"[CHART] Sequence Length: {SEQ_LEN} days (immediate swing trading patterns)")
+        print(f"[CHART] Features per day: {self.data_loader.get_feature_dim()}")
+        print(f"[REFRESH] Batch Size: {BATCH_SIZE}")
+        print(f"[BOOK] Learning Rate: {LEARNING_RATE}")
+        print(f"[CLOCK] Epochs: {EPOCHS}")
+        print(f"[TARGET] Early Stopping: {PATIENCE} epochs patience")
+        print(f"[CHART] Train/Val Split: 85/15 (1-day swing trading optimized)")
+        print(f"[LIGHTNING] Optimizer: {OPTIMIZER}")
+        print(f"[CHART] Loss Function: {LOSS_FUNCTION}")
+        print(f"[TARGET] Class Weights: Enabled for imbalanced swing signals")
+        print(f"[CHART] Mixed Precision: {MIXED_PRECISION}")
+        print(f"[REFRESH] Gradient Clipping: {MAX_GRAD_NORM}")
+        
+        # Add GPU debugging information
+        print(f"[SEARCH] DEVICE DEBUGGING:")
+        print(f"   Config Device: {self.device}")
+        print(f"   Model Device: {next(self.model.parameters()).device}")
+        print(f"   CUDA Available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"   GPU Device Count: {torch.cuda.device_count()}")
+            print(f"   Current GPU Device: {torch.cuda.current_device()}")
+            print(f"   GPU Device Name: {torch.cuda.get_device_name(0)}")
+            print(f"   GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+            print(f"   GPU Memory Cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
         print("=" * 50)
     
     def train_epoch(self):
@@ -230,7 +243,15 @@ class EnhancedAdvancedTrainer:
         if self.advanced_metrics:
             self.advanced_metrics.reset()
         
-        for batch_idx, (data, target) in enumerate(self.train_loader):
+        # GPU debugging - track initial memory
+        if torch.cuda.is_available():
+            initial_gpu_memory = torch.cuda.memory_allocated(0) / 1024**2
+            print(f"[SEARCH] Starting epoch - GPU Memory: {initial_gpu_memory:.2f} MB")
+        
+        # Progress bar for training
+        train_pbar = tqdm(self.train_loader, desc="Training", leave=False)
+        
+        for batch_idx, (data, target) in enumerate(train_pbar):
             data, target = data.to(self.device), target.to(self.device)
             
             # Add noise if enabled
@@ -260,7 +281,12 @@ class EnhancedAdvancedTrainer:
                 loss.backward()
                 
                 if GRADIENT_CLIPPING:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), MAX_GRAD_NORM)
+                    # Calculate gradient norm before clipping
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), MAX_GRAD_NORM)
+                    
+                    # Monitor gradient norms
+                    if batch_idx % 100 == 0:
+                        print(f"[CHART] Gradient norm: {grad_norm:.4f}")
                 
                 self.optimizer.step()
             
@@ -272,11 +298,40 @@ class EnhancedAdvancedTrainer:
             
             # Update advanced metrics
             if self.advanced_metrics:
-                self.advanced_metrics.update(output, target)
+                preds = output.argmax(dim=1)
+                self.advanced_metrics.update(preds, target)
+            
+            # Update progress bar with current metrics
+            current_loss = loss.item()
+            current_acc = pred.eq(target.view_as(pred)).sum().item() / target.size(0)
+            
+            # Check for NaN or infinite values
+            if not torch.isfinite(loss):
+                print(f"[WARNING] WARNING: Non-finite loss detected: {loss.item()}")
+                print(f"   Batch {batch_idx}, Loss: {loss.item()}")
+                print(f"   Output range: {output.min().item():.4f} to {output.max().item():.4f}")
+                print(f"   Target range: {target.min().item()} to {target.max().item()}")
+            
+            train_pbar.set_postfix({
+                'Loss': f'{current_loss:.4f}',
+                'Acc': f'{current_acc:.4f}',
+                'GPU_MB': f'{torch.cuda.memory_allocated(0) / 1024**2:.1f}' if torch.cuda.is_available() else 'N/A'
+            })
+            
+            # GPU debugging - monitor every 100 batches
+            if batch_idx % 100 == 0 and torch.cuda.is_available():
+                current_gpu_memory = torch.cuda.memory_allocated(0) / 1024**2
+                print(f"[SEARCH] Batch {batch_idx}: GPU Memory: {current_gpu_memory:.2f} MB")
         
         # Calculate epoch metrics
         avg_loss = total_loss / len(self.train_loader)
         accuracy = correct / total
+        
+        # GPU debugging - final epoch report
+        if torch.cuda.is_available():
+            final_gpu_memory = torch.cuda.memory_allocated(0) / 1024**2
+            memory_change = final_gpu_memory - initial_gpu_memory
+            print(f"[SEARCH] End of epoch - GPU Memory: {final_gpu_memory:.2f} MB (change: {memory_change:+.2f} MB)")
         
         return avg_loss, accuracy
     
@@ -293,8 +348,16 @@ class EnhancedAdvancedTrainer:
         if self.advanced_metrics:
             self.advanced_metrics.reset()
         
+        # GPU debugging - track validation memory
+        if torch.cuda.is_available():
+            val_initial_gpu_memory = torch.cuda.memory_allocated(0) / 1024**2
+            print(f"[SEARCH] Starting validation - GPU Memory: {val_initial_gpu_memory:.2f} MB")
+        
+        # Progress bar for validation
+        val_pbar = tqdm(self.val_loader, desc="Validation", leave=False)
+        
         with torch.no_grad():
-            for data, target in self.val_loader:
+            for data, target in val_pbar:
                 data, target = data.to(self.device), target.to(self.device)
                 
                 # Mixed precision validation
@@ -313,16 +376,32 @@ class EnhancedAdvancedTrainer:
                 
                 # Update advanced metrics
                 if self.advanced_metrics:
-                    self.advanced_metrics.update(output, target)
+                    preds = output.argmax(dim=1)
+                    self.advanced_metrics.update(preds, target)
+                
+                # Update progress bar with current metrics
+                current_loss = loss.item()
+                current_acc = pred.eq(target.view_as(pred)).sum().item() / target.size(0)
+                val_pbar.set_postfix({
+                    'Loss': f'{current_loss:.4f}',
+                    'Acc': f'{current_acc:.4f}',
+                    'GPU_MB': f'{torch.cuda.memory_allocated(0) / 1024**2:.1f}' if torch.cuda.is_available() else 'N/A'
+                })
         
         # Calculate validation metrics
         avg_loss = total_loss / len(self.val_loader)
         accuracy = correct / total
         
+        # GPU debugging - validation memory report
+        if torch.cuda.is_available():
+            val_final_gpu_memory = torch.cuda.memory_allocated(0) / 1024**2
+            val_memory_change = val_final_gpu_memory - val_initial_gpu_memory
+            print(f"[SEARCH] End of validation - GPU Memory: {val_final_gpu_memory:.2f} MB (change: {val_memory_change:+.2f} MB)")
+        
         # Get advanced metrics
         advanced_metrics = None
         if self.advanced_metrics:
-            advanced_metrics = self.advanced_metrics.get_metrics()
+            advanced_metrics = self.advanced_metrics.compute()
         
         return accuracy, avg_loss, advanced_metrics
     
@@ -345,99 +424,123 @@ class EnhancedAdvancedTrainer:
         """Standard training mode"""
         epochs = epochs or EPOCHS
         
-        print(f"\n🎯 Starting Standard Training for {epochs} epochs...")
+        print(f"\n[TARGET] Starting Standard Training for {epochs} epochs...")
         print("=" * 60)
+        print("[LIGHTBULB] Press Ctrl+C to stop training gracefully and save progress")
         
         best_accuracy = 0.0
         
-        for epoch in range(epochs):
-            self.epoch = epoch
+        # Progress bar for epochs
+        epoch_pbar = tqdm(range(epochs), desc="Training Progress", unit="epoch")
+        
+        try:
+            for epoch in epoch_pbar:
+                self.epoch = epoch
             
-            print(f"\n📈 Epoch {epoch + 1}/{epochs}")
-            print("-" * 40)
-            
-            # Warmup scheduler
-            if self.warmup_scheduler and epoch < WARMUP_EPOCHS:
-                self.warmup_scheduler.step()
-            
-            # Train for one epoch
-            train_loss, train_acc = self.train_epoch()
-            
-            # Validate
-            val_accuracy, val_loss, advanced_metrics = self.validate()
-            
-            # Store history
-            self.train_losses.append(train_loss)
-            self.val_accuracies.append(val_accuracy)
-            
-            # Enhanced logging
-            if self.enable_logging and self.logger:
-                train_metrics = {'loss': train_loss, 'accuracy': train_acc}
-                val_metrics = {'loss': val_loss, 'accuracy': val_accuracy}
-                model_state = {'total_params': sum(p.numel() for p in self.model.parameters())}
-                current_lr = self.optimizer.param_groups[0]['lr']
+                # GPU debugging - epoch start
+                if torch.cuda.is_available():
+                    epoch_gpu_memory = torch.cuda.memory_allocated(0) / 1024**2
+                    print(f"[SEARCH] Epoch {epoch + 1} start - GPU Memory: {epoch_gpu_memory:.2f} MB")
                 
-                self.logger.log_epoch(epoch, train_metrics, val_metrics, model_state, current_lr)
-            
-            # Print results
-            print(f"📊 Results:")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val Loss: {val_loss:.4f}")
-            print(f"  Val Accuracy: {val_accuracy:.4f}")
-            
-            if advanced_metrics:
-                print(f"  📈 Advanced Metrics:")
-                print(f"    F1 Macro: {advanced_metrics.get('f1_macro', 0):.4f}")
-                print(f"    F1 Weighted: {advanced_metrics.get('f1_weighted', 0):.4f}")
-                print(f"    Directional Accuracy: {advanced_metrics.get('directional_accuracy', 0):.4f}")
-                print(f"    Buy Signal Precision: {advanced_metrics.get('buy_signal_precision', 0):.4f}")
-                print(f"    Sell Signal Precision: {advanced_metrics.get('sell_signal_precision', 0):.4f}")
-                if 'high_confidence_accuracy' in advanced_metrics:
-                    print(f"    High Confidence Accuracy: {advanced_metrics['high_confidence_accuracy']:.4f}")
-                    print(f"    High Confidence Samples: {advanced_metrics['high_confidence_samples']}")
-            
-            # Learning rate scheduling
-            current_lr = self.optimizer.param_groups[0]['lr']
-            if LR_SCHEDULER == "ReduceLROnPlateau":
-                self.scheduler.step(val_accuracy)
-            elif LR_SCHEDULER in ["StepLR", "CosineAnnealing"]:
-                self.scheduler.step()
-            
-            # Update visualization
-            if self.visualizer:
-                self.visualizer.update(train_loss, val_loss, val_accuracy, current_lr)
-            
-            # Save best model
-            if val_accuracy > best_accuracy:
-                best_accuracy = val_accuracy
-                self.save_model(f"{self.model_save_path}.best")
-                print(f"✅ New best model saved! Accuracy: {best_accuracy:.4f}")
-            
-            # Save checkpoints
-            if SAVE_CHECKPOINTS and (epoch + 1) % CHECKPOINT_EVERY == 0:
-                checkpoint_path = f"{self.model_save_path}.checkpoint_epoch_{epoch + 1}"
-                self.save_model(checkpoint_path)
-                print(f"💾 Checkpoint saved: {checkpoint_path}")
-            
-            # Early stopping
-            if self.early_stopping:
-                self.early_stopping(val_accuracy, train_loss, val_loss)
-                if self.early_stopping.early_stop:
-                    print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
-                    print(f"   Best accuracy: {best_accuracy:.4f}")
-                    break
+                # Warmup scheduler
+                if self.warmup_scheduler and epoch < WARMUP_EPOCHS:
+                    self.warmup_scheduler.step()
+                
+                # Train for one epoch
+                train_loss, train_acc = self.train_epoch()
+                
+                # Validate
+                val_accuracy, val_loss, advanced_metrics = self.validate()
+                
+                # Store history
+                self.train_losses.append(train_loss)
+                self.val_accuracies.append(val_accuracy)
+                
+                # Enhanced logging
+                if self.enable_logging and self.logger:
+                    train_metrics = {'loss': train_loss, 'accuracy': train_acc}
+                    val_metrics = {'loss': val_loss, 'accuracy': val_accuracy}
+                    model_state = {'total_params': sum(p.numel() for p in self.model.parameters())}
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    
+                    self.logger.log_epoch(epoch, train_metrics, val_metrics, model_state, current_lr)
+                
+                # Update epoch progress bar
+                epoch_pbar.set_postfix({
+                    'Train_Loss': f'{train_loss:.4f}',
+                    'Val_Loss': f'{val_loss:.4f}',
+                    'Val_Acc': f'{val_accuracy:.4f}',
+                    'Best_Acc': f'{best_accuracy:.4f}'
+                })
+                
+                # Print results
+                print(f"[CHART] Results:")
+                print(f"  Train Loss: {train_loss:.4f}")
+                print(f"  Val Loss: {val_loss:.4f}")
+                print(f"  Val Accuracy: {val_accuracy:.4f}")
+                
+                if advanced_metrics:
+                    print(f"  [CHART] Advanced Metrics:")
+                    print(f"    F1 Macro: {advanced_metrics.get('f1_macro', 0):.4f}")
+                    print(f"    F1 Weighted: {advanced_metrics.get('f1_weighted', 0):.4f}")
+                    print(f"    Directional Accuracy: {advanced_metrics.get('directional_accuracy', 0):.4f}")
+                    print(f"    Buy Signal Precision: {advanced_metrics.get('buy_signal_precision', 0):.4f}")
+                    print(f"    Sell Signal Precision: {advanced_metrics.get('sell_signal_precision', 0):.4f}")
+                    if 'high_confidence_accuracy' in advanced_metrics:
+                        print(f"    High Confidence Accuracy: {advanced_metrics['high_confidence_accuracy']:.4f}")
+                        print(f"    High Confidence Samples: {advanced_metrics['high_confidence_samples']}")
+                
+                # Learning rate scheduling
+                current_lr = self.optimizer.param_groups[0]['lr']
+                if LR_SCHEDULER == "ReduceLROnPlateau":
+                    self.scheduler.step(val_accuracy)
+                elif LR_SCHEDULER in ["StepLR", "CosineAnnealing"]:
+                    self.scheduler.step()
+                
+                # Update visualization
+                if self.visualizer:
+                    self.visualizer.update(train_loss, val_loss, val_accuracy, current_lr)
+                
+                # Save best model
+                if val_accuracy > best_accuracy:
+                    best_accuracy = val_accuracy
+                    self.save_model(f"{self.model_save_path}.best")
+                    print(f"[SUCCESS] New best model saved! Accuracy: {best_accuracy:.4f}")
+                
+                # Save checkpoints
+                if SAVE_CHECKPOINTS and (epoch + 1) % CHECKPOINT_EVERY == 0:
+                    checkpoint_path = f"{self.model_save_path}.checkpoint_epoch_{epoch + 1}"
+                    self.save_model(checkpoint_path)
+                    print(f"[SAVE] Checkpoint saved: {checkpoint_path}")
+                
+                # Early stopping
+                if self.early_stopping:
+                    self.early_stopping(val_accuracy, train_loss, val_loss)
+                    if self.early_stopping.early_stop:
+                        print(f"[STOP] Early stopping triggered after {epoch + 1} epochs")
+                        print(f"   Best accuracy: {best_accuracy:.4f}")
+                        break
+        
+        except KeyboardInterrupt:
+            print(f"\n[WARNING] Training interrupted by user (Ctrl+C)")
+            print(f"[SAVE] Saving current progress...")
+            self.save_model(f"{self.model_save_path}.interrupted")
+            print(f"[SUCCESS] Progress saved to: {self.model_save_path}.interrupted")
+            print(f"[CHART] Training stopped gracefully")
+            print(f"[TROPHY] Best accuracy achieved: {best_accuracy:.4f}")
+            return best_accuracy
         
         # Generate final report if logging enabled
         if self.enable_logging and self.logger:
             report = self.logger.generate_training_report()
             print("\n" + "="*60)
-            print("📊 ENHANCED TRAINING REPORT")
+            print("[CHART] ENHANCED TRAINING REPORT")
             print("="*60)
             print(report)
         
         print("\n" + "=" * 60)
-        print(f"🏁 Training completed!")
-        print(f"📊 Final Results:")
+        print(f"[FINISH] Training completed!")
+        print(f"[CHART] Final Results:")
         print(f"   Best validation accuracy: {best_accuracy:.4f}")
         print(f"   Total epochs: {epoch + 1}")
         
@@ -448,7 +551,7 @@ class EnhancedAdvancedTrainer:
         if self.visualizer:
             plot_path = f"{self.model_save_path}_training_curves.png"
             self.visualizer.plot(save_path=plot_path)
-            print(f"📈 Training curves saved: {plot_path}")
+            print(f"[CHART] Training curves saved: {plot_path}")
         
         return best_accuracy
     
@@ -456,7 +559,7 @@ class EnhancedAdvancedTrainer:
         """Enhanced training mode with comprehensive logging"""
         epochs = epochs or EPOCHS
         
-        print(f"\n🎯 Starting Enhanced Training for {epochs} epochs...")
+        print(f"\n[TARGET] Starting Enhanced Training for {epochs} epochs...")
         print("=" * 60)
         
         best_accuracy = 0.0
@@ -499,35 +602,35 @@ class EnhancedAdvancedTrainer:
             if val_accuracy > best_accuracy:
                 best_accuracy = val_accuracy
                 self.save_model(f"{self.model_save_path}.best")
-                print(f"   💾 Saved best model (val_acc: {val_accuracy:.4f})")
+                print(f"   [SAVE] Saved best model (val_acc: {val_accuracy:.4f})")
             
             # Early stopping
             if self.early_stopping:
                 self.early_stopping(val_accuracy, train_loss, val_loss)
                 if self.early_stopping.early_stop:
-                    print(f"   ⏹️  Early stopping triggered at epoch {epoch+1}")
+                    print(f"   [STOP] Early stopping triggered at epoch {epoch+1}")
                     break
         
         # Generate final report
         if self.enable_logging and self.logger:
             report = self.logger.generate_training_report()
             print("\n" + "="*60)
-            print("📊 ENHANCED TRAINING REPORT")
+            print("[CHART] ENHANCED TRAINING REPORT")
             print("="*60)
             print(report)
         
-        print(f"\n✅ Enhanced training completed!")
-        print(f"📊 Best validation accuracy: {best_accuracy:.4f}")
+        print(f"\n[SUCCESS] Enhanced training completed!")
+        print(f"[CHART] Best validation accuracy: {best_accuracy:.4f}")
         
         return best_accuracy
     
     def _train_progressive(self):
         """Progressive training mode"""
         if not PROGRESSIVE_TRAINING_AVAILABLE:
-            print("❌ Progressive training not available. Falling back to standard training.")
+            print("[ERROR] Progressive training not available. Falling back to standard training.")
             return self._train_standard()
         
-        print(f"\n🎯 Starting Progressive Training...")
+        print(f"\n[TARGET] Starting Progressive Training...")
         print("=" * 60)
         
         # Run progressive training
@@ -567,7 +670,7 @@ class EnhancedAdvancedTrainer:
             'timestamp': datetime.now().isoformat()
         }, save_path)
         
-        print(f"💾 Model saved to: {save_path}")
+        print(f"[SAVE] Model saved to: {save_path}")
 
 
 # Backward compatibility - keep the old Trainer class name
@@ -598,7 +701,7 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"🎯 Enhanced Training Started")
+    print(f"[TARGET] Enhanced Training Started")
     print(f"Mode: {args.mode}")
     print(f"Epochs: {args.epochs or EPOCHS}")
     print(f"Enhanced Logging: {args.enable_logging}")
@@ -619,11 +722,11 @@ def main():
         # Train
         best_accuracy = trainer.train(epochs=args.epochs, mode=args.mode)
         
-        print(f"\n✅ Training completed successfully!")
-        print(f"📁 Check logs/ directory for detailed results")
+        print(f"\n[SUCCESS] Training completed successfully!")
+        print(f"[FOLDER] Check logs/ directory for detailed results")
         
     except Exception as e:
-        print(f"\n❌ Training failed: {e}")
+        print(f"\n[ERROR] Training failed: {e}")
         import traceback
         traceback.print_exc()
         return 1

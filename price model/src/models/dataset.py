@@ -39,6 +39,11 @@ class CandlestickDataset(Dataset):
         self.X = self.df[feature_columns].values.astype(np.float32)[self.indices]
         self.y = self.df['Label'].values.astype(np.int64)[self.indices]
         
+        # Normalize features to prevent numerical overflow
+        print("🔧 Normalizing features to prevent numerical overflow...")
+        self.X = self.normalize_features(self.X)
+        print(f"✅ Normalization complete. Feature range: {self.X.min():.4f} to {self.X.max():.4f}")
+        
         # Calculate dimensions
         self.seq_len = SEQ_LEN
         self.features_per_day = len(feature_columns) // SEQ_LEN
@@ -67,11 +72,37 @@ class CandlestickDataset(Dataset):
         """
         # Reshape features from flat to (seq_len, features_per_day)
         features = self.X[idx].reshape(self.seq_len, self.features_per_day)
-        features = torch.from_numpy(features)
+        features = torch.from_numpy(features).float()  # Ensure float32
         
         label = torch.tensor(self.y[idx], dtype=torch.long)
         
         return features, label
+    
+    def normalize_features(self, X):
+        """
+        Normalize features using robust scaling to handle outliers
+        
+        Args:
+            X (np.ndarray): Raw feature data
+            
+        Returns:
+            np.ndarray: Normalized feature data
+        """
+        # Use robust scaling (median and IQR) to handle outliers
+        median = np.median(X, axis=0)
+        q75, q25 = np.percentile(X, [75, 25], axis=0)
+        iqr = q75 - q25
+        
+        # Avoid division by zero
+        iqr[iqr == 0] = 1.0
+        
+        # Robust normalization: (x - median) / IQR
+        X_normalized = (X - median) / iqr
+        
+        # Clip extreme values to prevent outliers
+        X_normalized = np.clip(X_normalized, -10, 10)
+        
+        return X_normalized
     
     def get_feature_names(self):
         """Get the names of features in order"""

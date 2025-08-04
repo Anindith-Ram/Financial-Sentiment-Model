@@ -19,7 +19,7 @@ def download_kaggle_dataset():
     try:
         # Download latest version using kagglehub
         download_path = kagglehub.dataset_download("thedevastator/tweet-sentiment-s-impact-on-stock-returns")
-        print(f"✅ Dataset downloaded to: {download_path}")
+        print(f"[SUCCESS] Dataset downloaded to: {download_path}")
         
         # Create our target directory if it doesn't exist
         target_dir = Path("data/external")
@@ -30,7 +30,7 @@ def download_kaggle_dataset():
         csv_files = list(download_dir.glob("*.csv"))
         
         if not csv_files:
-            print("❌ No CSV files found in the downloaded dataset!")
+            print("[ERROR] No CSV files found in the downloaded dataset!")
             return False
         
         # Copy the main CSV file to our project structure
@@ -43,7 +43,7 @@ def download_kaggle_dataset():
         print()
         print("🎉 SUCCESS! Dataset ready for use.")
         print(f"📍 Dataset location: {target_file}")
-        print(f"📊 File size: {target_file.stat().st_size / (1024*1024):.1f} MB")
+                    print(f"[CHART] File size: {target_file.stat().st_size / (1024*1024):.1f} MB")
         
         # Show a preview of the file structure
         if csv_files:
@@ -62,7 +62,7 @@ def download_kaggle_dataset():
         return True
         
     except Exception as e:
-        print(f"❌ Error downloading dataset: {e}")
+        print(f"[ERROR] Error downloading dataset: {e}")
         print()
         print("🔧 Troubleshooting:")
         print("1. Make sure you have kagglehub installed: pip install kagglehub")
