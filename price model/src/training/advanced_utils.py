@@ -1,305 +1,283 @@
 """
-Advanced Training Utilities
-Implements all modern ML training improvements for the price model
+Advanced training utilities for improved model performance
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import (
-    StepLR, CosineAnnealingLR, ReduceLROnPlateau, OneCycleLR
-)
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts, OneCycleLR
 import numpy as np
-import matplotlib.pyplot as plt
-from typing import Dict, List, Optional, Tuple
-import warnings
-from sklearn.metrics import f1_score, precision_score, recall_score
+from typing import Dict, Any, Optional
+import math
 
 
 class FocalLoss(nn.Module):
     """
-    Focal Loss for addressing class imbalance
+    Focal Loss for handling class imbalance
     """
-    def __init__(self, alpha=1.0, gamma=2.0, weight=None):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
-        self.weight = weight
+        self.reduction = reduction
         
     def forward(self, inputs, targets):
-        ce_loss = nn.CrossEntropyLoss(weight=self.weight, reduction='none')(inputs, targets)
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 class LabelSmoothingLoss(nn.Module):
     """
-    Label Smoothing for reducing overconfidence
+    Label smoothing for better generalization
     """
-    def __init__(self, num_classes, smoothing=0.1, weight=None):
+    def __init__(self, classes, smoothing=0.1, dim=-1):
         super(LabelSmoothingLoss, self).__init__()
-        self.num_classes = num_classes
+        self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
-        self.weight = weight
-        
-    def forward(self, inputs, targets):
-        log_probs = nn.LogSoftmax(dim=1)(inputs)
+        self.cls = classes
+        self.dim = dim
+
+    def forward(self, pred, target):
+        pred = pred.log_softmax(dim=self.dim)
         with torch.no_grad():
-            true_dist = torch.zeros_like(log_probs)
-            true_dist.fill_(self.smoothing / (self.num_classes - 1))
-            true_dist.scatter_(1, targets.data.unsqueeze(1), 1.0 - self.smoothing)
-            
-        if self.weight is not None:
-            true_dist = true_dist * self.weight.unsqueeze(0)
-            
-        return torch.mean(torch.sum(-true_dist * log_probs, dim=1))
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
 
 
-class EarlyStopping:
+class CosineAnnealingWarmRestartsWithWarmup:
     """
-    Early stopping with patience and overfitting detection
+    Cosine annealing with warm restarts and warmup
     """
-    def __init__(self, patience=7, min_delta=0.001, overfit_threshold=5):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.overfit_threshold = overfit_threshold
-        
-        self.best_score = None
-        self.counter = 0
-        self.overfit_counter = 0
-        self.early_stop = False
-        
-    def __call__(self, val_score, train_loss=None, val_loss=None):
-        score = val_score
-        
-        if self.best_score is None:
-            self.best_score = score
-        elif score < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.counter = 0
-            
-        # Check for overfitting
-        if train_loss is not None and val_loss is not None:
-            if val_loss > train_loss * 1.1:  # 10% tolerance
-                self.overfit_counter += 1
-            else:
-                self.overfit_counter = 0
-                
-            if self.overfit_counter >= self.overfit_threshold:
-                self.early_stop = True
-                print(f"Early stopping due to overfitting (val_loss > train_loss for {self.overfit_threshold} epochs)")
-
-
-class WarmupScheduler:
-    """
-    Learning rate warmup scheduler
-    """
-    def __init__(self, optimizer, warmup_epochs, start_lr, target_lr):
+    def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, warmup_epochs=0, warmup_start_lr=1e-6):
         self.optimizer = optimizer
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.eta_min = eta_min
         self.warmup_epochs = warmup_epochs
-        self.start_lr = start_lr
-        self.target_lr = target_lr
+        self.warmup_start_lr = warmup_start_lr
+        self.base_lr = optimizer.param_groups[0]['lr']
         self.current_epoch = 0
         
-    def step(self):
+    def step(self, epoch=None):
+        if epoch is not None:
+            self.current_epoch = epoch
+            
         if self.current_epoch < self.warmup_epochs:
-            lr = self.start_lr + (self.target_lr - self.start_lr) * self.current_epoch / self.warmup_epochs
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
+            # Warmup phase
+            lr = self.warmup_start_lr + (self.base_lr - self.warmup_start_lr) * self.current_epoch / self.warmup_epochs
+        else:
+            # Cosine annealing phase
+            T_cur = self.current_epoch - self.warmup_epochs
+            T_i = self.T_0
+            while T_cur >= T_i:
+                T_cur -= T_i
+                T_i *= self.T_mult
+            lr = self.eta_min + (self.base_lr - self.eta_min) * (1 + math.cos(math.pi * T_cur / T_i)) / 2
+            
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+            
         self.current_epoch += 1
 
 
+def get_optimizer(parameters, optimizer_name, **kwargs):
+    """Get optimizer with enhanced settings"""
+    if optimizer_name.lower() == 'adamw':
+        return optim.AdamW(
+            parameters,
+            lr=kwargs.get('lr', 1e-4),
+            weight_decay=kwargs.get('weight_decay', 1e-4),
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+    elif optimizer_name.lower() == 'adam':
+        return optim.Adam(
+            parameters,
+            lr=kwargs.get('lr', 1e-4),
+            weight_decay=kwargs.get('weight_decay', 1e-4),
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+    elif optimizer_name.lower() == 'sgd':
+        return optim.SGD(
+            parameters,
+            lr=kwargs.get('lr', 1e-3),
+            momentum=0.9,
+            weight_decay=kwargs.get('weight_decay', 1e-4),
+            nesterov=True
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+
+def get_loss_function(loss_name, num_classes=5, device='cuda', **kwargs):
+    """Get loss function with enhanced options"""
+    if loss_name.lower() == 'crossentropyloss':
+        class_weights = kwargs.get('class_weights', None)
+        if class_weights is not None:
+            class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        
+        return nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=kwargs.get('label_smoothing', 0.05)
+        ).to(device)
+    elif loss_name.lower() == 'focalloss':
+        return FocalLoss(
+            alpha=kwargs.get('focal_alpha', 0.25),
+            gamma=kwargs.get('focal_gamma', 2.0)
+        ).to(device)
+    elif loss_name.lower() == 'labelsmoothingloss':
+        return LabelSmoothingLoss(
+            classes=num_classes,
+            smoothing=kwargs.get('label_smoothing', 0.1)
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown loss function: {loss_name}")
+
+
+def get_scheduler(optimizer, scheduler_name, epochs, **kwargs):
+    """Get learning rate scheduler with enhanced options"""
+    if scheduler_name.lower() == 'reducelronplateau':
+        return ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=kwargs.get('lr_factor', 0.5),
+            patience=kwargs.get('lr_patience', 3),
+            min_lr=kwargs.get('lr_min', 1e-6),
+            verbose=True
+        )
+    elif scheduler_name.lower() == 'cosineannealingwarmrestarts':
+        return CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=epochs // 4,
+            T_mult=2,
+            eta_min=kwargs.get('lr_min', 1e-6)
+        )
+    elif scheduler_name.lower() == 'cosineannealingwarmrestartswithwarmup':
+        return CosineAnnealingWarmRestartsWithWarmup(
+            optimizer,
+            T_0=epochs // 4,
+            T_mult=2,
+            eta_min=kwargs.get('lr_min', 1e-6),
+            warmup_epochs=kwargs.get('warmup_epochs', 3),
+            warmup_start_lr=kwargs.get('warmup_start_lr', 1e-6)
+        )
+    elif scheduler_name.lower() == 'onecyclelr':
+        return OneCycleLR(
+            optimizer,
+            max_lr=kwargs.get('lr', 1e-4),
+            epochs=epochs,
+            steps_per_epoch=kwargs.get('steps_per_epoch', 100),
+            pct_start=0.3,
+            anneal_strategy='cos'
+        )
+    else:
+        raise ValueError(f"Unknown scheduler: {scheduler_name}")
+
+
+class EarlyStopping:
+    """Enhanced early stopping with multiple criteria"""
+    def __init__(self, patience=10, min_delta=0.001, mode='min', restore_best_weights=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.restore_best_weights = restore_best_weights
+        self.best_score = None
+        self.counter = 0
+        self.best_weights = None
+        
+    def __call__(self, val_loss, model=None):
+        if self.best_score is None:
+            self.best_score = val_loss
+            if model is not None and self.restore_best_weights:
+                self.best_weights = model.state_dict().copy()
+        elif (self.mode == 'min' and val_loss < self.best_score - self.min_delta) or \
+             (self.mode == 'max' and val_loss > self.best_score + self.min_delta):
+            self.best_score = val_loss
+            self.counter = 0
+            if model is not None and self.restore_best_weights:
+                self.best_weights = model.state_dict().copy()
+        else:
+            self.counter += 1
+            
+        if self.counter >= self.patience:
+            if model is not None and self.restore_best_weights and self.best_weights is not None:
+                model.load_state_dict(self.best_weights)
+            return True
+        return False
+
+
 class AdvancedMetrics:
-    """
-    Track advanced metrics during training
-    """
+    """Advanced metrics tracking"""
     def __init__(self):
         self.reset()
         
     def reset(self):
-        self.predictions = []
-        self.targets = []
-        self.confidences = []
-        
-    def update(self, preds, targets, confidences=None):
-        self.predictions.extend(preds.cpu().detach().numpy())
-        self.targets.extend(targets.cpu().detach().numpy())
-        if confidences is not None:
-            self.confidences.extend(confidences.cpu().detach().numpy())
-            
-    def compute(self):
-        preds = np.array(self.predictions)
-        targets = np.array(self.targets)
-        
-        # Basic metrics
-        accuracy = (preds == targets).mean()
-        
-        # F1 scores
-        f1_macro = f1_score(targets, preds, average='macro', zero_division=0)
-        f1_weighted = f1_score(targets, preds, average='weighted', zero_division=0)
-        
-        # Directional accuracy (Buy vs Sell vs Hold)
-        pred_direction = np.where(preds <= 1, 0, np.where(preds >= 3, 2, 1))
-        target_direction = np.where(targets <= 1, 0, np.where(targets >= 3, 2, 1))
-        directional_accuracy = (pred_direction == target_direction).mean()
-        
-        # Signal precision
-        buy_mask_pred = preds >= 3
-        buy_mask_target = targets >= 3
-        buy_precision = (buy_mask_pred & buy_mask_target).sum() / buy_mask_pred.sum() if buy_mask_pred.sum() > 0 else 0
-        
-        sell_mask_pred = preds <= 1
-        sell_mask_target = targets <= 1
-        sell_precision = (sell_mask_pred & sell_mask_target).sum() / sell_mask_pred.sum() if sell_mask_pred.sum() > 0 else 0
-        
-        metrics = {
-            'accuracy': accuracy,
-            'f1_macro': f1_macro,
-            'f1_weighted': f1_weighted,
-            'directional_accuracy': directional_accuracy,
-            'buy_signal_precision': buy_precision,
-            'sell_signal_precision': sell_precision
-        }
-        
-        # High confidence metrics
-        if self.confidences:
-            confidences = np.array(self.confidences)
-            high_conf_mask = confidences > 0.7
-            if high_conf_mask.sum() > 0:
-                high_conf_accuracy = (preds[high_conf_mask] == targets[high_conf_mask]).mean()
-                metrics['high_confidence_accuracy'] = high_conf_accuracy
-                metrics['high_confidence_samples'] = high_conf_mask.sum()
-                
-        return metrics
-
-
-class TrainingVisualizer:
-    """
-    Real-time training visualization
-    """
-    def __init__(self):
         self.train_losses = []
         self.val_losses = []
+        self.train_accuracies = []
         self.val_accuracies = []
         self.learning_rates = []
         
-    def update(self, train_loss, val_loss, val_accuracy, lr):
+    def update(self, train_loss, val_loss, train_acc, val_acc, lr):
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
-        self.val_accuracies.append(val_accuracy)
+        self.train_accuracies.append(train_acc)
+        self.val_accuracies.append(val_acc)
         self.learning_rates.append(lr)
         
-    def plot(self, save_path=None):
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
-        
-        # Loss curves
-        epochs = range(1, len(self.train_losses) + 1)
-        ax1.plot(epochs, self.train_losses, 'b-', label='Training Loss')
-        ax1.plot(epochs, self.val_losses, 'r-', label='Validation Loss')
-        ax1.set_title('Training vs Validation Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True)
-        
-        # Accuracy curve
-        ax2.plot(epochs, self.val_accuracies, 'g-', label='Validation Accuracy')
-        ax2.set_title('Validation Accuracy')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy')
-        ax2.legend()
-        ax2.grid(True)
-        
-        # Learning rate schedule
-        ax3.plot(epochs, self.learning_rates, 'm-', label='Learning Rate')
-        ax3.set_title('Learning Rate Schedule')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Learning Rate')
-        ax3.legend()
-        ax3.grid(True)
-        ax3.set_yscale('log')
-        
-        # Loss difference (overfitting indicator)
-        loss_diff = np.array(self.val_losses) - np.array(self.train_losses)
-        ax4.plot(epochs, loss_diff, 'orange', label='Val Loss - Train Loss')
-        ax4.axhline(y=0, color='k', linestyle='--', alpha=0.5)
-        ax4.set_title('Overfitting Indicator')
-        ax4.set_xlabel('Epoch')
-        ax4.set_ylabel('Loss Difference')
-        ax4.legend()
-        ax4.grid(True)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        else:
-            plt.show()
+    def get_summary(self):
+        return {
+            'best_train_loss': min(self.train_losses) if self.train_losses else None,
+            'best_val_loss': min(self.val_losses) if self.val_losses else None,
+            'best_train_acc': max(self.train_accuracies) if self.train_accuracies else None,
+            'best_val_acc': max(self.val_accuracies) if self.val_accuracies else None,
+            'final_lr': self.learning_rates[-1] if self.learning_rates else None
+        }
 
 
-def get_optimizer(model_parameters, optimizer_name, lr, weight_decay=0):
-    """
-    Get optimizer by name
-    """
-    # Ensure model_parameters is a list
-    if not isinstance(model_parameters, list):
-        model_parameters = list(model_parameters)
-    
-    if not model_parameters:
-        raise ValueError("Empty parameter list provided to optimizer!")
-    
-    print(f"Creating {optimizer_name} optimizer with {len(model_parameters)} parameter groups")
-    
-    optimizers = {
-        'Adam': optim.Adam(model_parameters, lr=lr, weight_decay=weight_decay),
-        'AdamW': optim.AdamW(model_parameters, lr=lr, weight_decay=weight_decay),
-        'SGD': optim.SGD(model_parameters, lr=lr, weight_decay=weight_decay, momentum=0.9)
-    }
-    
-    if optimizer_name not in optimizers:
-        warnings.warn(f"Optimizer {optimizer_name} not found, using AdamW")
-        optimizer_name = 'AdamW'
+class TrainingVisualizer:
+    """Enhanced training visualization"""
+    def __init__(self):
+        pass
         
-    return optimizers[optimizer_name]
+    def plot_training_curves(self, metrics):
+        """Plot training curves (placeholder for matplotlib integration)"""
+        # This would integrate with matplotlib for visualization
+        pass
 
 
-def get_scheduler(optimizer, scheduler_name, **kwargs):
-    """
-    Get learning rate scheduler by name
-    """
-    if scheduler_name == "StepLR":
-        return StepLR(optimizer, step_size=kwargs.get('step_size', 10), gamma=kwargs.get('gamma', 0.1))
-    elif scheduler_name == "CosineAnnealing":
-        return CosineAnnealingLR(optimizer, T_max=kwargs.get('T_max', 50))
-    elif scheduler_name == "ReduceLROnPlateau":
-        return ReduceLROnPlateau(optimizer, mode='max', patience=kwargs.get('patience', 3), 
-                               factor=kwargs.get('factor', 0.5))
-    elif scheduler_name == "OneCycle":
-        return OneCycleLR(optimizer, max_lr=kwargs.get('max_lr', 0.01), 
-                         total_steps=kwargs.get('total_steps', 100))
+def add_noise_to_data(data, noise_strength=0.01):
+    """Add Gaussian noise to training data for regularization"""
+    noise = torch.randn_like(data) * noise_strength
+    return data + noise
+
+
+def mixup_data(data, targets, alpha=0.2):
+    """Mixup data augmentation"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
     else:
-        warnings.warn(f"Scheduler {scheduler_name} not found, using ReduceLROnPlateau")
-        return ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.5, verbose=True)
+        lam = 1
 
+    batch_size = data.size(0)
+    index = torch.randperm(batch_size).to(data.device)
 
-def get_loss_function(loss_name, num_classes=5, class_weights=None, device='cpu', **kwargs):
-    """
-    Get loss function by name
-    """
-    # Move class weights to device if provided
-    if class_weights is not None:
-        class_weights = class_weights.to(device)
+    mixed_data = lam * data + (1 - lam) * data[index, :]
+    targets_a, targets_b = targets, targets[index]
     
-    if loss_name == "CrossEntropy":
-        return nn.CrossEntropyLoss(weight=class_weights)
-    elif loss_name == "FocalLoss":
-        return FocalLoss(alpha=kwargs.get('alpha', 1.0), gamma=kwargs.get('gamma', 2.0), weight=class_weights)
-    elif loss_name == "LabelSmoothing":
-        return LabelSmoothingLoss(num_classes, smoothing=kwargs.get('smoothing', 0.1), weight=class_weights)
-    else:
-        warnings.warn(f"Loss function {loss_name} not found, using CrossEntropy")
-        return nn.CrossEntropyLoss(weight=class_weights) 
+    return mixed_data, targets_a, targets_b, lam
+
+
+def mixup_criterion(criterion, pred, targets_a, targets_b, lam):
+    """Mixup loss calculation"""
+    return lam * criterion(pred, targets_a) + (1 - lam) * criterion(pred, targets_b) 

@@ -10,7 +10,7 @@ __author__ = "Financial Analysis Model Suite"
 try:
     from .data.data_collection import build_dataset, load_recent_data
     from .models.cnn_model import CandleCNN
-    from .training.train import Trainer
+    # Standard training removed - using progressive training only
     from .inference.predict import CandlestickPredictor, predict_next_open
     from .utils.helpers import label_class, trade_signal, get_signal_description
     
@@ -18,7 +18,6 @@ try:
         'build_dataset',
         'load_recent_data', 
         'CandleCNN',
-        'Trainer',
         'CandlestickPredictor',
         'predict_next_open',
         'label_class',

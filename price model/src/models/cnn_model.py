@@ -165,7 +165,8 @@ class EnhancedCandleCNN(nn.Module):
 
 # Backward compatibility
 class CandleCNN(EnhancedCandleCNN):
-    """Backward compatibility wrapper"""
+    """Simplified CNN model for candlestick pattern recognition"""
+    
     def __init__(self, features_per_day: int = 65, num_classes: int = 5, 
-                 hidden_size: int = 64, use_attention: bool = False):
+                 hidden_size: int = 128, use_attention: bool = False):
         super().__init__(features_per_day, num_classes, hidden_size, use_attention) 

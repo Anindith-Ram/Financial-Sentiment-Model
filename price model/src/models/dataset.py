@@ -8,6 +8,89 @@ from torch.utils.data import Dataset
 from config.config import SEQ_LEN
 
 
+class FinancialDataset(Dataset):
+    """
+    PyTorch Dataset for financial time series data with 5-day sequences
+    Compatible with TimeGPT integration
+    """
+    
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 5):
+        """
+        Initialize the dataset
+        
+        Args:
+            X (np.ndarray): Feature data of shape (n_samples, n_features)
+            y (np.ndarray): Labels of shape (n_samples,)
+            seq_len (int): Sequence length (default: 5 for 5-day context)
+        """
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.int64)
+        self.seq_len = seq_len
+        
+        # Calculate features per day
+        self.features_per_day = X.shape[1] // seq_len
+        
+        print(f"📊 FinancialDataset initialized:")
+        print(f"   Samples: {len(self.X)}")
+        print(f"   Features per day: {self.features_per_day}")
+        print(f"   Sequence length: {self.seq_len}")
+        print(f"   Total features: {X.shape[1]}")
+        print(f"   Class distribution: {np.bincount(self.y)}")
+        
+        # Normalize features
+        self.X = self.normalize_features(self.X)
+    
+    def __len__(self):
+        """Return the number of samples"""
+        return len(self.y)
+    
+    def __getitem__(self, idx):
+        """
+        Get a single sample
+        
+        Args:
+            idx (int): Sample index
+            
+        Returns:
+            tuple: (features, label)
+                features: torch.Tensor of shape (seq_len, features_per_day)
+                label: torch.Tensor scalar
+        """
+        # Reshape features from flat to (seq_len, features_per_day)
+        features = self.X[idx].reshape(self.seq_len, self.features_per_day)
+        features = torch.from_numpy(features).float()
+        
+        label = torch.tensor(self.y[idx], dtype=torch.long)
+        
+        return features, label
+    
+    def normalize_features(self, X):
+        """
+        Normalize features using robust scaling to handle outliers
+        
+        Args:
+            X (np.ndarray): Raw feature data
+            
+        Returns:
+            np.ndarray: Normalized feature data
+        """
+        # Use robust scaling (median and IQR) to handle outliers
+        median = np.median(X, axis=0)
+        q75, q25 = np.percentile(X, [75, 25], axis=0)
+        iqr = q75 - q25
+        
+        # Avoid division by zero
+        iqr[iqr == 0] = 1.0
+        
+        # Robust normalization: (x - median) / IQR
+        X_normalized = (X - median) / iqr
+        
+        # Clip extreme values to prevent outliers
+        X_normalized = np.clip(X_normalized, -10, 10)
+        
+        return X_normalized
+
+
 class CandlestickDataset(Dataset):
     """
     PyTorch Dataset for candlestick pattern recognition
@@ -22,7 +105,18 @@ class CandlestickDataset(Dataset):
             train_split (float): Proportion of data to use for training
             is_training (bool): Whether this is a training dataset
         """
-        self.df = pd.read_csv(csv_file)
+        print(f"Loading dataset from: {csv_file}")
+        
+        # Load data with explicit data types to prevent object arrays
+        self.df = pd.read_csv(csv_file, dtype={
+            'Ticker': str,
+            'Label': np.int64
+        })
+        
+        # Convert all feature columns to float32
+        feature_columns = [col for col in self.df.columns if col not in ['Ticker', 'Label']]
+        for col in feature_columns:
+            self.df[col] = pd.to_numeric(self.df[col], errors='coerce').fillna(0.0).astype(np.float32)
         
         # Split data randomly
         np.random.seed(42)  # For reproducible splits
@@ -34,10 +128,12 @@ class CandlestickDataset(Dataset):
         else:
             self.indices = indices[split_idx:]
         
-        # Extract features and labels
-        feature_columns = [col for col in self.df.columns if col not in ['Ticker', 'Label']]
+        # Extract features and labels with explicit data types
         self.X = self.df[feature_columns].values.astype(np.float32)[self.indices]
         self.y = self.df['Label'].values.astype(np.int64)[self.indices]
+        
+        # Clear the dataframe to free memory
+        del self.df
         
         # Normalize features to prevent numerical overflow
         print("🔧 Normalizing features to prevent numerical overflow...")
@@ -53,6 +149,7 @@ class CandlestickDataset(Dataset):
         print(f"  Features per day: {self.features_per_day}")
         print(f"  Sequence length: {self.seq_len}")
         print(f"  Class distribution: {np.bincount(self.y)}")
+        print(f"  Memory usage: {self.X.nbytes / 1024**2:.1f} MB")
     
     def __len__(self):
         """Return the number of samples"""
@@ -145,6 +242,12 @@ class CandlestickDataLoader:
         self.train_split = train_split
         self.num_workers = num_workers
         
+        # Clear memory before loading
+        import gc
+        gc.collect()
+        
+        print(f"Creating data loaders with batch size: {batch_size}")
+        
         # Create datasets
         self.train_dataset = CandlestickDataset(
             csv_file, train_split=train_split, is_training=True
@@ -152,6 +255,9 @@ class CandlestickDataLoader:
         self.val_dataset = CandlestickDataset(
             csv_file, train_split=train_split, is_training=False
         )
+        
+        # Clear memory after loading
+        gc.collect()
     
     def get_train_loader(self):
         """Get training data loader"""
@@ -160,7 +266,8 @@ class CandlestickDataLoader:
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_workers
+            num_workers=self.num_workers,
+            pin_memory=False  # Disable pin_memory to reduce memory usage
         )
     
     def get_val_loader(self):
@@ -170,7 +277,8 @@ class CandlestickDataLoader:
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers
+            num_workers=self.num_workers,
+            pin_memory=False  # Disable pin_memory to reduce memory usage
         )
     
     def get_feature_dim(self):

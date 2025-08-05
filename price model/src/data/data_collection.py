@@ -1390,22 +1390,7 @@ def calculate_swing_trading_features(df):
     return df
 
 
-def calculate_focused_features(df):
-    """
-    DEPRECATED: Use calculate_swing_trading_features instead
-    This function is kept for backward compatibility but should not be used
-    """
-    print("⚠️  DEPRECATED: Use calculate_swing_trading_features instead")
-    return calculate_swing_trading_features(df)
-
-
-def calculate_all_features(df):
-    """
-    DEPRECATED: Use calculate_swing_trading_features instead
-    This function is kept for backward compatibility but should not be used
-    """
-    print("⚠️  DEPRECATED: Use calculate_swing_trading_features instead")
-    return calculate_swing_trading_features(df)
+# DEPRECATED FUNCTIONS REMOVED - Use calculate_optimized_features instead
 
 
 def build_dataset(csv_output=None, apply_quality_fixes=True, nan_strategy='auto', 
@@ -1471,7 +1456,7 @@ def build_dataset(csv_output=None, apply_quality_fixes=True, nan_strategy='auto'
             verify_data_quality(df, ticker)
 
             # Calculate all features using appropriate data sources
-            df = calculate_swing_trading_features(df)  # Use swing trading features
+            df = calculate_optimized_features(df)  # Use optimized features for better accuracy
             
             if df is None or len(df) < needed_length:
                 print(f"Skipping {ticker}: insufficient data")
@@ -1693,7 +1678,7 @@ def build_dataset_incremental(csv_output=None, save_interval=100):
             verify_data_quality(df, ticker)
 
             # Calculate all features using appropriate data sources
-            df = calculate_swing_trading_features(df)  # Use swing trading features
+            df = calculate_optimized_features(df)  # Use optimized features for better accuracy
             
             if df is None or len(df) < needed_length:
                 print(f"Skipping {ticker}: insufficient data")
@@ -2178,7 +2163,7 @@ def load_recent_data(ticker, days=10):
     df = validate_and_clean_data(df)
 
     # Calculate all features using professional approach
-    df = calculate_swing_trading_features(df)
+    df = calculate_optimized_features(df)
     
     # Return the most recent 'days' worth of data
     return df.tail(days)
@@ -2250,6 +2235,265 @@ def compare_adjusted_vs_raw_analysis(ticker="AAPL", days=252):
     print(f"  Return correlation: {analysis['return_correlation']:.4f}")
     
     return analysis 
+
+
+def calculate_optimized_features(df):
+    """
+    Calculate optimized features for 5-day context and 1-day return prediction
+    Removes redundant and low-impact indicators to improve model performance
+    
+    🔧 OPTIMIZED FOR:
+    - 5-day context window
+    - 1-day return prediction
+    - Reduced feature redundancy
+    - Higher signal-to-noise ratio
+    
+    Args:
+        df (pd.DataFrame): DataFrame with explicit raw and adjusted columns
+        
+    Returns:
+        pd.DataFrame: DataFrame with optimized features
+    """
+    df = df.copy()
+    
+    # Validate and clean data first
+    df = validate_and_clean_data(df)
+    
+    print("[OPTIMIZED] Calculating optimized features for 5-day context...")
+    print(f"[OPTIMIZED] Input data shape: {df.shape}")
+    
+    # Convert to float64 for TA-Lib compatibility
+    close_adj = df['Close_adj'].values.astype(np.float64)
+    high_adj = df['High_adj'].values.astype(np.float64)
+    low_adj = df['Low_adj'].values.astype(np.float64)
+    volume_adj = df['Volume_adj'].values.astype(np.float64)
+    
+    # Get adaptive periods based on data length
+    data_length = len(close_adj)
+    periods = get_adaptive_periods(data_length)
+    
+    print(f"[OPTIMIZED] Using adaptive periods for {data_length} data points:")
+    print(f"   [OPTIMIZED] Periods: {periods}")
+    
+    # 1. OPTIMIZED TREND ANALYSIS (Focus on medium-term trends)
+    print("[OPTIMIZED] Computing optimized trend analysis...")
+    trend_features = []
+    
+    try:
+        # Keep only medium-term moving averages (better for 5-day context)
+        df['sma_20'] = safe_sma(close_adj, periods['sma'] * 2)
+        df['sma_50'] = safe_sma(close_adj, periods['sma'] * 5)
+        df['ema_20'] = safe_ema(close_adj, periods['ema'] * 2)
+        
+        # Trend strength and position (with safe division)
+        df['trend_strength'] = np.where(
+            df['sma_50'] != 0,
+            (df['sma_20'] - df['sma_50']) / df['sma_50'],
+            np.nan
+        )
+        df['above_sma_20'] = (df['Close_adj'] > df['sma_20']).astype(int)
+        df['above_sma_50'] = (df['Close_adj'] > df['sma_50']).astype(int)
+        
+        # Golden/Death Cross signals (important for 5-day context)
+        df['golden_cross'] = (df['sma_20'] > df['sma_50']) & (df['sma_20'].shift(1) <= df['sma_50'].shift(1))
+        df['death_cross'] = (df['sma_20'] < df['sma_50']) & (df['sma_20'].shift(1) >= df['sma_50'].shift(1))
+        
+        trend_features = ['sma_20', 'sma_50', 'ema_20', 'trend_strength', 
+                        'above_sma_20', 'above_sma_50', 'golden_cross', 'death_cross']
+        print(f"[SUCCESS] Optimized trend features added: {len(trend_features)} features")
+        
+    except Exception as e:
+        print(f"[WARNING] Error calculating trend indicators: {e}")
+    
+    # 2. OPTIMIZED MOMENTUM (Keep only most effective indicators)
+    print("[OPTIMIZED] Computing optimized momentum indicators...")
+    momentum_features = []
+    
+    try:
+        # Core momentum indicators (most effective for 1-day prediction)
+        df['rsi'] = safe_rsi(close_adj, periods['rsi'])
+        df['rsi_oversold'] = (df['rsi'] < 30).astype(int)
+        df['rsi_overbought'] = (df['rsi'] > 70).astype(int)
+        
+        # MACD (most effective momentum indicator)
+        macd, macd_signal, macd_hist = safe_macd(close_adj, periods['macd_fast'], periods['macd_slow'])
+        df['macd'] = macd
+        df['macd_signal'] = macd_signal
+        df['macd_histogram'] = macd_hist
+        df['macd_bullish'] = (macd > macd_signal).astype(int)
+        df['macd_bearish'] = (macd < macd_signal).astype(int)
+        
+        # Stochastic (good for short-term momentum)
+        stoch_k, stoch_d = safe_stochastic(high_adj, low_adj, close_adj, periods['stoch'])
+        df['stoch_k'] = stoch_k
+        df['stoch_d'] = stoch_d
+        df['stoch_oversold'] = (stoch_k < 20).astype(int)
+        df['stoch_overbought'] = (stoch_k > 80).astype(int)
+        
+        momentum_features = ['rsi', 'rsi_oversold', 'rsi_overbought',
+                           'macd', 'macd_signal', 'macd_histogram', 'macd_bullish', 'macd_bearish',
+                           'stoch_k', 'stoch_d', 'stoch_oversold', 'stoch_overbought']
+        print(f"[SUCCESS] Optimized momentum features added: {len(momentum_features)} features")
+        
+    except Exception as e:
+        print(f"[WARNING] Error calculating momentum indicators: {e}")
+    
+    # 3. OPTIMIZED VOLATILITY (Keep only essential volatility measures)
+    print("[OPTIMIZED] Computing optimized volatility analysis...")
+    volatility_features = []
+    
+    try:
+        # ATR for volatility measurement
+        df['atr'] = safe_atr(high_adj, low_adj, close_adj, periods['atr'])
+        
+        # Bollinger Bands (essential for mean reversion)
+        bb_upper, bb_middle, bb_lower = safe_bollinger_bands(close_adj, periods['bb'])
+        df['bb_upper'] = bb_upper
+        df['bb_middle'] = bb_middle
+        df['bb_lower'] = bb_lower
+        
+        # BB position (most important BB feature)
+        bb_range = df['bb_upper'] - df['bb_lower']
+        df['bb_position'] = np.where(
+            bb_range != 0,
+            (df['Close_adj'] - df['bb_lower']) / bb_range,
+            np.nan
+        )
+        
+        # Price near Bollinger Bands (important for 1-day prediction)
+        df['near_bb_upper'] = (df['Close_adj'] > df['bb_upper'] * 0.98).astype(int)
+        df['near_bb_lower'] = (df['Close_adj'] < df['bb_lower'] * 1.02).astype(int)
+        
+        volatility_features = ['atr', 'bb_upper', 'bb_middle', 'bb_lower',
+                             'bb_position', 'near_bb_upper', 'near_bb_lower']
+        print(f"[SUCCESS] Optimized volatility features added: {len(volatility_features)} features")
+        
+    except Exception as e:
+        print(f"[WARNING] Error calculating volatility indicators: {e}")
+    
+    # 4. OPTIMIZED SUPPORT/RESISTANCE (Keep only essential levels)
+    print("[OPTIMIZED] Computing optimized support/resistance levels...")
+    support_resistance_features = []
+    
+    try:
+        # Key levels (20-day lookback is optimal for 5-day context)
+        df['resistance_20'] = df['High_adj'].rolling(20).max()
+        df['support_20'] = df['Low_adj'].rolling(20).min()
+        df['price_position'] = (df['Close_adj'] - df['support_20']) / (df['resistance_20'] - df['support_20'])
+        
+        # Near support/resistance (important for 1-day prediction)
+        df['near_resistance'] = (df['Close_adj'] > df['resistance_20'] * 0.98).astype(int)
+        df['near_support'] = (df['Close_adj'] < df['support_20'] * 1.02).astype(int)
+        
+        # Breakout signals (crucial for 1-day prediction)
+        df['breakout_up'] = (df['Close_adj'] > df['resistance_20'].shift(1)).astype(int)
+        df['breakout_down'] = (df['Close_adj'] < df['support_20'].shift(1)).astype(int)
+        
+        support_resistance_features = ['resistance_20', 'support_20', 'price_position', 'near_resistance', 
+                                    'near_support', 'breakout_up', 'breakout_down']
+        print(f"[SUCCESS] Optimized support/resistance features added: {len(support_resistance_features)} features")
+        
+    except Exception as e:
+        print(f"[WARNING] Error calculating support/resistance: {e}")
+    
+    # 5. OPTIMIZED VOLUME (Keep only essential volume indicators)
+    print("[OPTIMIZED] Computing optimized volume analysis...")
+    volume_features = []
+    
+    try:
+        # Volume confirmation (essential for 1-day prediction)
+        df['volume_sma_20'] = talib.SMA(volume_adj, timeperiod=20)
+        df['volume_ratio'] = volume_adj / df['volume_sma_20']
+        df['high_volume'] = (df['volume_ratio'] > 1.5).astype(int)
+        df['low_volume'] = (df['volume_ratio'] < 0.5).astype(int)
+        
+        # OBV for trend confirmation
+        df['obv'] = talib.OBV(close_adj, volume_adj)
+        
+        volume_features = ['volume_sma_20', 'volume_ratio', 'high_volume', 'low_volume', 'obv']
+        print(f"[SUCCESS] Optimized volume features added: {len(volume_features)} features")
+        
+    except Exception as e:
+        print(f"⚠️  Error calculating volume indicators: {e}")
+    
+    # 6. OPTIMIZED PRICE ACTION (Keep only essential patterns)
+    print("[OPTIMIZED] Computing optimized price action features...")
+    price_action_features = []
+    
+    # Returns (focus on 1-day and 3-day for 5-day context)
+    df['daily_return'] = df['Close_adj'].pct_change()
+    df['return_3d'] = df['Close_adj'].pct_change(3)
+    
+    # Gap analysis (important for 1-day prediction)
+    df['gap'] = (df['Open_adj'] - df['Close_adj'].shift(1)) / df['Close_adj'].shift(1)
+    df['gap_up'] = (df['gap'] > 0.01).astype(int)
+    df['gap_down'] = (df['gap'] < -0.01).astype(int)
+    
+    # Price relationships (essential for pattern recognition)
+    df['hl_ratio'] = (df['High_adj'] - df['Low_adj']) / df['Close_adj']
+    df['oc_ratio'] = (df['Open_adj'] - df['Close_adj']) / df['Close_adj']
+    
+    # Swing patterns (important for 5-day context)
+    df['higher_high'] = (df['High_adj'] > df['High_adj'].shift(1)).astype(int)
+    df['lower_low'] = (df['Low_adj'] < df['Low_adj'].shift(1)).astype(int)
+    
+    price_action_features = ['daily_return', 'return_3d', 'gap', 'gap_up', 'gap_down',
+                           'hl_ratio', 'oc_ratio', 'higher_high', 'lower_low']
+    
+    print(f"[SUCCESS] Optimized price action features added: {len(price_action_features)} features")
+    
+    # 7. OPTIMIZED CANDLESTICK PATTERNS (Keep only 4 most effective)
+    print("[OPTIMIZED] Computing optimized candlestick patterns...")
+    pattern_features = []
+    
+    try:
+        # Keep only 4 most effective patterns for 1-day prediction
+        key_patterns = [
+            'CDLHAMMER', 'CDLENGULFING', 'CDLMORNINGSTAR', 'CDLEVENINGSTAR'
+        ]
+        
+        open_raw = df['Open_raw'].values.astype(np.float64)
+        high_raw = df['High_raw'].values.astype(np.float64)
+        low_raw = df['Low_raw'].values.astype(np.float64)
+        close_raw = df['Close_raw'].values.astype(np.float64)
+        
+        for pattern in key_patterns:
+            try:
+                pattern_result = getattr(talib, pattern)(
+                    open_raw, high_raw, low_raw, close_raw
+                )
+                df[f'pattern_{pattern}'] = (pattern_result != 0).astype(int)
+                pattern_count = df[f'pattern_{pattern}'].sum()
+                print(f"[OPTIMIZED] {pattern}: {pattern_count} patterns found")
+                pattern_features.append(f'pattern_{pattern}')
+            except Exception as e:
+                print(f"⚠️  Error calculating {pattern}: {e}")
+                df[f'pattern_{pattern}'] = 0
+                pattern_features.append(f'pattern_{pattern}')
+        
+        print(f"[SUCCESS] Optimized candlestick patterns added: {len(pattern_features)} features")
+        
+    except Exception as e:
+        print(f"⚠️  Error calculating candlestick patterns: {e}")
+    
+    # Summary
+    total_features = len(trend_features) + len(momentum_features) + len(volatility_features) + \
+                   len(support_resistance_features) + len(volume_features) + len(price_action_features) + \
+                   len(pattern_features)
+    
+    print(f"\n[OPTIMIZED] FEATURE SUMMARY:")
+    print(f"[TREND] Optimized trend features: {len(trend_features)}")
+    print(f"[MOMENTUM] Optimized momentum features: {len(momentum_features)}")
+    print(f"[VOLATILITY] Optimized volatility features: {len(volatility_features)}")
+    print(f"[SUPPORT] Optimized support/resistance features: {len(support_resistance_features)}")
+    print(f"[VOLUME] Optimized volume features: {len(volume_features)}")
+    print(f"[PRICE] Optimized price action features: {len(price_action_features)}")
+    print(f"[PATTERN] Optimized candlestick patterns: {len(pattern_features)}")
+    print(f"[TOTAL] TOTAL OPTIMIZED FEATURES: {total_features}")
+    print(f"[SHAPE] Final data shape: {df.shape}")
+    
+    print(f"[SUCCESS] Optimized features complete. Total features: {len(df.columns)}")
+    return df
 
 
 if __name__ == "__main__":

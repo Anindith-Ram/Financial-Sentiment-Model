@@ -13,8 +13,10 @@ import os
 import json
 from datetime import datetime
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from config.config import TRAINING_CONFIG, DATA_CONFIG
+from config.config import TRAINING_CONFIG, DATA_CONFIG, MODEL_CONFIG
 from src.training.advanced_utils import (
     get_optimizer, get_loss_function, get_scheduler,
     EarlyStopping, AdvancedMetrics, TrainingVisualizer
@@ -30,16 +32,18 @@ class ProgressiveTrainer:
     Stage 2: Fine-tune on 400 tickers with lower learning rate
     """
     
-    def __init__(self, model, device='cuda'):
+    def __init__(self, model, device='cuda', experiment_name=None):
         """
         Initialize progressive trainer
         
         Args:
             model: CNN model
             device: Training device
+            experiment_name: Name for this training experiment
         """
         self.model = model
         self.device = device
+        self.experiment_name = experiment_name or f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # Create necessary directories
         os.makedirs('models', exist_ok=True)
@@ -59,9 +63,9 @@ class ProgressiveTrainer:
         self.stage3_lr = TRAINING_CONFIG.get('STAGE_3_LR', 5e-5)
         self.stage4_lr = TRAINING_CONFIG.get('STAGE_4_LR', 1e-5)
         self.stage1_batch_size = TRAINING_CONFIG.get('STAGE_1_BATCH_SIZE', 256)
-        self.stage2_batch_size = TRAINING_CONFIG.get('STAGE_2_BATCH_SIZE', 128)
-        self.stage3_batch_size = TRAINING_CONFIG.get('STAGE_3_BATCH_SIZE', 64)
-        self.stage4_batch_size = TRAINING_CONFIG.get('STAGE_4_BATCH_SIZE', 32)
+        self.stage2_batch_size = TRAINING_CONFIG.get('STAGE_2_BATCH_SIZE', 64)
+        self.stage3_batch_size = TRAINING_CONFIG.get('STAGE_3_BATCH_SIZE', 32)
+        self.stage4_batch_size = TRAINING_CONFIG.get('STAGE_4_BATCH_SIZE', 16)
         
         # Training logs
         self.stage1_logs = []
@@ -70,7 +74,10 @@ class ProgressiveTrainer:
         self.stage4_logs = []
         self.combined_logs = []
         
-        print(f"Progressive Trainer initialized:")
+        # Cache for data loaders to prevent multiple instances
+        self._data_loaders_cache = {}
+        
+        print(f"Progressive Trainer initialized for experiment: {self.experiment_name}")
         print(f"  Stage 1: {self.stage1_tickers} tickers, {self.stage1_epochs} epochs, LR={self.stage1_lr}")
         print(f"  Stage 2: {self.stage2_tickers} tickers, {self.stage2_epochs} epochs, LR={self.stage2_lr}")
         print(f"  Stage 3: {self.stage3_tickers} tickers, {self.stage3_epochs} epochs, LR={self.stage3_lr}")
@@ -78,7 +85,7 @@ class ProgressiveTrainer:
     
     def train_epoch(self, train_loader: DataLoader) -> Tuple[float, float, Dict]:
         """
-        Train for one epoch
+        Train for one epoch with enhanced regularization
         
         Args:
             train_loader: Training data loader
@@ -97,29 +104,69 @@ class ProgressiveTrainer:
         for batch_idx, (data, target) in enumerate(pbar):
             data, target = data.to(self.device), target.to(self.device)
             
+            # Enhanced regularization: Add noise to data
+            if TRAINING_CONFIG.get('ADD_NOISE', False):
+                noise_strength = TRAINING_CONFIG.get('NOISE_STRENGTH', 0.02)
+                noise = torch.randn_like(data) * noise_strength
+                data = data + noise
+            
+            # Enhanced regularization: Mixup augmentation
+            if TRAINING_CONFIG.get('MIXUP_AUGMENTATION', False):
+                mixup_alpha = TRAINING_CONFIG.get('MIXUP_ALPHA', 0.3)
+                if mixup_alpha > 0:
+                    lam = np.random.beta(mixup_alpha, mixup_alpha)
+                    batch_size = data.size(0)
+                    index = torch.randperm(batch_size).to(self.device)
+                    data = lam * data + (1 - lam) * data[index, :]
+                    target_a, target_b = target, target[index]
+            
             self.optimizer.zero_grad()
+            
+            # Forward pass
             output = self.model(data)
-            loss = self.criterion(output, target)
+            
+            # Enhanced loss calculation
+            if TRAINING_CONFIG.get('MIXUP_AUGMENTATION', False) and mixup_alpha > 0:
+                loss = lam * self.criterion(output, target_a) + (1 - lam) * self.criterion(output, target_b)
+            else:
+                loss = self.criterion(output, target)
+            
+            # Backward pass with gradient clipping
             loss.backward()
+            
+            # Enhanced regularization: Gradient clipping
+            if TRAINING_CONFIG.get('GRADIENT_CLIPPING', False):
+                max_grad_norm = TRAINING_CONFIG.get('MAX_GRAD_NORM', 0.5)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+            
             self.optimizer.step()
             
-            total_loss += loss.item()
+            # Calculate accuracy
             pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
+            if TRAINING_CONFIG.get('MIXUP_AUGMENTATION', False) and mixup_alpha > 0:
+                # For mixup, use original target for accuracy
+                correct += pred.eq(target_a.view_as(pred)).sum().item()
+            else:
+                correct += pred.eq(target.view_as(pred)).sum().item()
+            
             total += target.size(0)
+            total_loss += loss.item()
             
             # Update progress bar
-            current_loss = total_loss / (batch_idx + 1)
-            current_acc = correct / total
             pbar.set_postfix({
-                'Loss': f'{current_loss:.4f}',
-                'Acc': f'{current_acc:.3f}'
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{100. * correct / total:.1f}%'
             })
         
         avg_loss = total_loss / len(train_loader)
         accuracy = correct / total
         
-        return avg_loss, accuracy, {}
+        return avg_loss, accuracy, {
+            'loss': avg_loss,
+            'accuracy': accuracy,
+            'correct': correct,
+            'total': total
+        }
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, float, Dict]:
         """
@@ -152,10 +199,10 @@ class ProgressiveTrainer:
                 
                 # Update progress bar
                 current_loss = total_loss / (batch_idx + 1)
-                current_acc = correct / total
+                current_acc = 100. * correct / total
                 pbar.set_postfix({
                     'Loss': f'{current_loss:.4f}',
-                    'Acc': f'{current_acc:.3f}'
+                    'Acc': f'{current_acc:.1f}%'
                 })
         
         avg_loss = total_loss / len(val_loader)
@@ -174,30 +221,7 @@ class ProgressiveTrainer:
         print("📊 PREPARING STAGE 1 DATA (using existing dataset)")
         print("="*60)
         
-        # Use existing dataset from config
-        from config.config import DATA_OUTPUT_PATH
-        dataset_path = DATA_OUTPUT_PATH
-        
-        print(f"[INFO] Using existing dataset: {dataset_path}")
-        
-        # Progress bar for data loading
-        with tqdm(total=1, desc="Loading Stage 1 Data", leave=False) as pbar:
-            # Create data loaders
-            data_loader = CandlestickDataLoader(
-                csv_file=dataset_path,
-                batch_size=self.stage1_batch_size,
-                train_split=0.8
-            )
-            
-            train_loader, val_loader = data_loader.get_loaders()
-            pbar.update(1)
-        
-        print(f"✅ Stage 1 data prepared:")
-        print(f"   Training samples: {len(train_loader.dataset)}")
-        print(f"   Validation samples: {len(val_loader.dataset)}")
-        print(f"   Batch size: {self.stage1_batch_size}")
-        
-        return train_loader, val_loader
+        return self._get_cached_data_loaders("Stage 1", self.stage1_batch_size)
     
     def prepare_stage2_data(self) -> Tuple[DataLoader, DataLoader]:
         """
@@ -210,30 +234,7 @@ class ProgressiveTrainer:
         print("📊 PREPARING STAGE 2 DATA (using existing dataset)")
         print("="*60)
         
-        # Use existing dataset from config
-        from config.config import DATA_OUTPUT_PATH
-        dataset_path = DATA_OUTPUT_PATH
-        
-        print(f"[INFO] Using existing dataset: {dataset_path}")
-        
-        # Progress bar for data loading
-        with tqdm(total=1, desc="Loading Stage 2 Data", leave=False) as pbar:
-            # Create data loaders
-            data_loader = CandlestickDataLoader(
-                csv_file=dataset_path,
-                batch_size=self.stage2_batch_size,
-                train_split=0.8
-            )
-            
-            train_loader, val_loader = data_loader.get_loaders()
-            pbar.update(1)
-        
-        print(f"✅ Stage 2 data prepared:")
-        print(f"   Training samples: {len(train_loader.dataset)}")
-        print(f"   Validation samples: {len(val_loader.dataset)}")
-        print(f"   Batch size: {self.stage2_batch_size}")
-        
-        return train_loader, val_loader
+        return self._get_cached_data_loaders("Stage 2", self.stage2_batch_size)
     
     def prepare_stage3_data(self) -> Tuple[DataLoader, DataLoader]:
         """
@@ -246,30 +247,7 @@ class ProgressiveTrainer:
         print("📊 PREPARING STAGE 3 DATA (using existing dataset)")
         print("="*60)
         
-        # Use existing dataset from config
-        from config.config import DATA_OUTPUT_PATH
-        dataset_path = DATA_OUTPUT_PATH
-        
-        print(f"[INFO] Using existing dataset: {dataset_path}")
-        
-        # Progress bar for data loading
-        with tqdm(total=1, desc="Loading Stage 3 Data", leave=False) as pbar:
-            # Create data loaders
-            data_loader = CandlestickDataLoader(
-                csv_file=dataset_path,
-                batch_size=self.stage3_batch_size,
-                train_split=0.8
-            )
-            
-            train_loader, val_loader = data_loader.get_loaders()
-            pbar.update(1)
-        
-        print(f"✅ Stage 3 data prepared:")
-        print(f"   Training samples: {len(train_loader.dataset)}")
-        print(f"   Validation samples: {len(val_loader.dataset)}")
-        print(f"   Batch size: {self.stage3_batch_size}")
-        
-        return train_loader, val_loader
+        return self._get_cached_data_loaders("Stage 3", self.stage3_batch_size)
     
     def prepare_stage4_data(self) -> Tuple[DataLoader, DataLoader]:
         """
@@ -282,30 +260,7 @@ class ProgressiveTrainer:
         print("📊 PREPARING STAGE 4 DATA (using existing dataset)")
         print("="*60)
         
-        # Use existing dataset from config
-        from config.config import DATA_OUTPUT_PATH
-        dataset_path = DATA_OUTPUT_PATH
-        
-        print(f"[INFO] Using existing dataset: {dataset_path}")
-        
-        # Progress bar for data loading
-        with tqdm(total=1, desc="Loading Stage 4 Data", leave=False) as pbar:
-            # Create data loaders
-            data_loader = CandlestickDataLoader(
-                csv_file=dataset_path,
-                batch_size=self.stage4_batch_size,
-                train_split=0.8
-            )
-            
-            train_loader, val_loader = data_loader.get_loaders()
-            pbar.update(1)
-        
-        print(f"✅ Stage 4 data prepared:")
-        print(f"   Training samples: {len(train_loader.dataset)}")
-        print(f"   Validation samples: {len(val_loader.dataset)}")
-        print(f"   Batch size: {self.stage4_batch_size}")
-        
-        return train_loader, val_loader
+        return self._get_cached_data_loaders("Stage 4", self.stage4_batch_size)
     
     def train_stage1(self, train_loader: DataLoader, val_loader: DataLoader) -> Dict:
         """
@@ -333,7 +288,8 @@ class ProgressiveTrainer:
         self.criterion = get_loss_function(
             TRAINING_CONFIG['LOSS_FUNCTION'],
             num_classes=5,
-            device=self.device
+            device=self.device,
+            class_weights=TRAINING_CONFIG.get('CLASS_WEIGHTS', None)
         )
         
         self.scheduler = get_scheduler(
@@ -348,6 +304,11 @@ class ProgressiveTrainer:
             patience=TRAINING_CONFIG['PATIENCE'],
             min_delta=TRAINING_CONFIG['MIN_DELTA']
         )
+        
+        # Enhanced overfitting detection
+        self.overfit_threshold = TRAINING_CONFIG.get('OVERFIT_THRESHOLD', 3)
+        self.train_val_gaps = []
+        self.best_train_val_gap = float('inf')
         
         self.advanced_metrics = AdvancedMetrics()
         self.visualizer = TrainingVisualizer()
@@ -389,10 +350,21 @@ class ProgressiveTrainer:
             epoch_pbar.set_postfix({
                 'Train Loss': f'{train_loss:.4f}',
                 'Val Loss': f'{val_loss:.4f}',
-                'Train Acc': f'{train_acc:.3f}',
-                'Val Acc': f'{val_acc:.3f}',
+                'Train Acc': f'{train_acc*100:.1f}%',
+                'Val Acc': f'{val_acc*100:.1f}%',
                 'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
+            
+            # Enhanced overfitting detection
+            train_val_gap = abs(train_acc - val_acc)
+            self.train_val_gaps.append(train_val_gap)
+            
+            # Check for overfitting
+            if train_val_gap > self.overfit_threshold:
+                epoch_pbar.write(f"   ⚠️  Overfitting detected! Train/Val gap: {train_val_gap:.2f}% > {self.overfit_threshold}%")
+                if len(self.train_val_gaps) >= 3 and all(gap > self.overfit_threshold for gap in self.train_val_gaps[-3:]):
+                    epoch_pbar.write(f"   🛑 Stopping due to persistent overfitting")
+                    break
             
             # Save best model
             if val_loss < best_val_loss:
@@ -402,8 +374,9 @@ class ProgressiveTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'epoch': epoch,
                     'val_loss': val_loss,
-                    'stage': 1
-                }, 'models/stage1_best.pth')
+                    'stage': 1,
+                    'features_per_day': self.model.features_per_day if hasattr(self.model, 'features_per_day') else 340
+                }, f'models/{self.experiment_name}/stage1_best.pth')
                 epoch_pbar.write(f"   💾 Saved stage 1 best model (val_loss: {val_loss:.4f})")
             
             # Early stopping
@@ -413,12 +386,12 @@ class ProgressiveTrainer:
         
         # Save stage 1 logs
         self.stage1_logs = stage1_logs
-        with open('logs/stage1_logs.json', 'w') as f:
+        with open(f'logs/{self.experiment_name}/stage1_logs.json', 'w') as f:
             json.dump(stage1_logs, f, indent=2, default=str)
         
         print(f"\n✅ Stage 1 completed:")
         print(f"   Best validation loss: {best_val_loss:.4f}")
-        print(f"   Training logs saved to: logs/stage1_logs.json")
+        print(f"   Training logs saved to: logs/{self.experiment_name}/stage1_logs.json")
         
         return {
             'best_val_loss': best_val_loss,
@@ -442,8 +415,8 @@ class ProgressiveTrainer:
         print("="*60)
         
         # Load best model from stage 1
-        if os.path.exists('models/stage1_best.pth'):
-            checkpoint = torch.load('models/stage1_best.pth', map_location=self.device)
+        if os.path.exists(f'models/{self.experiment_name}/stage1_best.pth'):
+            checkpoint = torch.load(f'models/{self.experiment_name}/stage1_best.pth', map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"✅ Loaded stage 1 best model (val_loss: {checkpoint['val_loss']:.4f})")
         else:
@@ -460,7 +433,8 @@ class ProgressiveTrainer:
         self.criterion = get_loss_function(
             TRAINING_CONFIG['LOSS_FUNCTION'],
             num_classes=5,
-            device=self.device
+            device=self.device,
+            class_weights=TRAINING_CONFIG.get('CLASS_WEIGHTS', None)
         )
         
         self.scheduler = get_scheduler(
@@ -513,8 +487,8 @@ class ProgressiveTrainer:
             epoch_pbar.set_postfix({
                 'Train Loss': f'{train_loss:.4f}',
                 'Val Loss': f'{val_loss:.4f}',
-                'Train Acc': f'{train_acc:.3f}',
-                'Val Acc': f'{val_acc:.3f}',
+                'Train Acc': f'{train_acc*100:.1f}%',
+                'Val Acc': f'{val_acc*100:.1f}%',
                 'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
             
@@ -526,8 +500,9 @@ class ProgressiveTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'epoch': epoch,
                     'val_loss': val_loss,
-                    'stage': 2
-                }, 'models/stage2_best.pth')
+                    'stage': 2,
+                    'features_per_day': self.model.features_per_day if hasattr(self.model, 'features_per_day') else 340
+                }, f'models/{self.experiment_name}/stage2_best.pth')
                 epoch_pbar.write(f"   💾 Saved stage 2 best model (val_loss: {val_loss:.4f})")
             
             # Early stopping
@@ -537,12 +512,12 @@ class ProgressiveTrainer:
         
         # Save stage 2 logs
         self.stage2_logs = stage2_logs
-        with open('logs/stage2_logs.json', 'w') as f:
+        with open(f'logs/{self.experiment_name}/stage2_logs.json', 'w') as f:
             json.dump(stage2_logs, f, indent=2, default=str)
         
         print(f"\n✅ Stage 2 completed:")
         print(f"   Best validation loss: {best_val_loss:.4f}")
-        print(f"   Training logs saved to: logs/stage2_logs.json")
+        print(f"   Training logs saved to: logs/{self.experiment_name}/stage2_logs.json")
         
         return {
             'best_val_loss': best_val_loss,
@@ -566,8 +541,8 @@ class ProgressiveTrainer:
         print("="*60)
         
         # Load best model from stage 2
-        if os.path.exists('models/stage2_best.pth'):
-            checkpoint = torch.load('models/stage2_best.pth', map_location=self.device)
+        if os.path.exists(f'models/{self.experiment_name}/stage2_best.pth'):
+            checkpoint = torch.load(f'models/{self.experiment_name}/stage2_best.pth', map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"✅ Loaded stage 2 best model (val_loss: {checkpoint['val_loss']:.4f})")
         else:
@@ -584,7 +559,8 @@ class ProgressiveTrainer:
         self.criterion = get_loss_function(
             TRAINING_CONFIG['LOSS_FUNCTION'],
             num_classes=5,
-            device=self.device
+            device=self.device,
+            class_weights=TRAINING_CONFIG.get('CLASS_WEIGHTS', None)
         )
         
         self.scheduler = get_scheduler(
@@ -637,8 +613,8 @@ class ProgressiveTrainer:
             epoch_pbar.set_postfix({
                 'Train Loss': f'{train_loss:.4f}',
                 'Val Loss': f'{val_loss:.4f}',
-                'Train Acc': f'{train_acc:.3f}',
-                'Val Acc': f'{val_acc:.3f}',
+                'Train Acc': f'{train_acc*100:.1f}%',
+                'Val Acc': f'{val_acc*100:.1f}%',
                 'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
             
@@ -650,8 +626,9 @@ class ProgressiveTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'epoch': epoch,
                     'val_loss': val_loss,
-                    'stage': 3
-                }, 'models/stage3_best.pth')
+                    'stage': 3,
+                    'features_per_day': self.model.features_per_day if hasattr(self.model, 'features_per_day') else 340
+                }, f'models/{self.experiment_name}/stage3_best.pth')
                 epoch_pbar.write(f"   💾 Saved stage 3 best model (val_loss: {val_loss:.4f})")
             
             # Early stopping
@@ -661,12 +638,12 @@ class ProgressiveTrainer:
         
         # Save stage 3 logs
         self.stage3_logs = stage3_logs
-        with open('logs/stage3_logs.json', 'w') as f:
+        with open(f'logs/{self.experiment_name}/stage3_logs.json', 'w') as f:
             json.dump(stage3_logs, f, indent=2, default=str)
         
         print(f"\n✅ Stage 3 completed:")
         print(f"   Best validation loss: {best_val_loss:.4f}")
-        print(f"   Training logs saved to: logs/stage3_logs.json")
+        print(f"   Training logs saved to: logs/{self.experiment_name}/stage3_logs.json")
         
         return {
             'best_val_loss': best_val_loss,
@@ -690,8 +667,8 @@ class ProgressiveTrainer:
         print("="*60)
         
         # Load best model from stage 3
-        if os.path.exists('models/stage3_best.pth'):
-            checkpoint = torch.load('models/stage3_best.pth', map_location=self.device)
+        if os.path.exists(f'models/{self.experiment_name}/stage3_best.pth'):
+            checkpoint = torch.load(f'models/{self.experiment_name}/stage3_best.pth', map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"✅ Loaded stage 3 best model (val_loss: {checkpoint['val_loss']:.4f})")
         else:
@@ -708,7 +685,8 @@ class ProgressiveTrainer:
         self.criterion = get_loss_function(
             TRAINING_CONFIG['LOSS_FUNCTION'],
             num_classes=5,
-            device=self.device
+            device=self.device,
+            class_weights=TRAINING_CONFIG.get('CLASS_WEIGHTS', None)
         )
         
         self.scheduler = get_scheduler(
@@ -761,8 +739,8 @@ class ProgressiveTrainer:
             epoch_pbar.set_postfix({
                 'Train Loss': f'{train_loss:.4f}',
                 'Val Loss': f'{val_loss:.4f}',
-                'Train Acc': f'{train_acc:.3f}',
-                'Val Acc': f'{val_acc:.3f}',
+                'Train Acc': f'{train_acc*100:.1f}%',
+                'Val Acc': f'{val_acc*100:.1f}%',
                 'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
             
@@ -774,8 +752,9 @@ class ProgressiveTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'epoch': epoch,
                     'val_loss': val_loss,
-                    'stage': 4
-                }, 'models/stage4_best.pth')
+                    'stage': 4,
+                    'features_per_day': self.model.features_per_day if hasattr(self.model, 'features_per_day') else 340
+                }, f'models/{self.experiment_name}/stage4_best.pth')
                 epoch_pbar.write(f"   💾 Saved stage 4 best model (val_loss: {val_loss:.4f})")
             
             # Early stopping
@@ -785,12 +764,12 @@ class ProgressiveTrainer:
         
         # Save stage 4 logs
         self.stage4_logs = stage4_logs
-        with open('logs/stage4_logs.json', 'w') as f:
+        with open(f'logs/{self.experiment_name}/stage4_logs.json', 'w') as f:
             json.dump(stage4_logs, f, indent=2, default=str)
         
         print(f"\n✅ Stage 4 completed:")
         print(f"   Best validation loss: {best_val_loss:.4f}")
-        print(f"   Training logs saved to: logs/stage4_logs.json")
+        print(f"   Training logs saved to: logs/{self.experiment_name}/stage4_logs.json")
         
         return {
             'best_val_loss': best_val_loss,
@@ -809,7 +788,9 @@ class ProgressiveTrainer:
         print("🎯 PROGRESSIVE TRAINING STARTED")
         print("="*80)
         
-        # Create logs directory
+        # Create experiment-specific directories
+        os.makedirs(f'logs/{self.experiment_name}', exist_ok=True)
+        os.makedirs(f'models/{self.experiment_name}', exist_ok=True)
         os.makedirs('logs', exist_ok=True)
         os.makedirs('models', exist_ok=True)
         
@@ -851,23 +832,26 @@ class ProgressiveTrainer:
         # Combine results
         total_time = datetime.now() - start_time
         
-        combined_results = {
-            'stage1': stage_results['stage1'],
-            'stage2': stage_results['stage2'],
-            'stage3': stage_results['stage3'],
-            'stage4': stage_results['stage4'],
-            'total_training_time': str(total_time),
-            'combined_logs': self.combined_logs
+        # Save final results
+        final_results = {
+            'total_time': total_time,
+            'stages': stage_results,
+            'final_model_path': f'models/{self.experiment_name}/stage4_best.pth',
+            'experiment_name': self.experiment_name
         }
         
-        # Save combined results
-        with open('logs/progressive_training_results.json', 'w') as f:
-            json.dump(combined_results, f, indent=2, default=str)
+        # Generate training curves
+        self.generate_training_curves(stage_results)
         
-        # Generate summary
-        self._print_progressive_summary(combined_results)
+        # Save results to JSON
+        results_path = f'logs/{self.experiment_name}/training_results.json'
+        with open(results_path, 'w') as f:
+            json.dump(final_results, f, indent=2, default=str)
         
-        return combined_results
+        print(f"\n📊 Training results saved to: {results_path}")
+        print(f"🎯 Final model saved to: {final_results['final_model_path']}")
+        
+        return final_results
     
     def _print_progressive_summary(self, results: Dict):
         """Print progressive training summary"""
@@ -906,18 +890,212 @@ class ProgressiveTrainer:
             print(f"   ⚠️  No overall improvement")
         
         print(f"\n📁 Files saved:")
-        print(f"   - models/stage1_best.pth")
-        print(f"   - models/stage2_best.pth")
-        print(f"   - models/stage3_best.pth")
-        print(f"   - models/stage4_best.pth")
-        print(f"   - logs/stage1_logs.json")
-        print(f"   - logs/stage2_logs.json")
-        print(f"   - logs/stage3_logs.json")
-        print(f"   - logs/stage4_logs.json")
-        print(f"   - logs/progressive_training_results.json")
+        print(f"   - models/{self.experiment_name}/stage1_best.pth")
+        print(f"   - models/{self.experiment_name}/stage2_best.pth")
+        print(f"   - models/{self.experiment_name}/stage3_best.pth")
+        print(f"   - models/{self.experiment_name}/stage4_best.pth")
+        print(f"   - logs/{self.experiment_name}/stage1_logs.json")
+        print(f"   - logs/{self.experiment_name}/stage2_logs.json")
+        print(f"   - logs/{self.experiment_name}/stage3_logs.json")
+        print(f"   - logs/{self.experiment_name}/stage4_logs.json")
+        print(f"   - logs/{self.experiment_name}/progressive_training_results.json")
+
+    def _get_cached_data_loaders(self, stage_name, batch_size):
+        """
+        Get cached data loaders to prevent multiple dataset instances
+        
+        Args:
+            stage_name (str): Name of the stage
+            batch_size (int): Batch size for this stage
+            
+        Returns:
+            tuple: (train_loader, val_loader)
+        """
+        cache_key = f"{stage_name}_{batch_size}"
+        
+        if cache_key not in self._data_loaders_cache:
+            print(f"Creating new data loaders for {stage_name} with batch size {batch_size}")
+            
+            # Clear memory before creating new loaders
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # Create data loaders
+            from config.config import DATA_OUTPUT_PATH
+            from src.models.dataset import CandlestickDataLoader
+            
+            data_loader = CandlestickDataLoader(
+                csv_file=DATA_OUTPUT_PATH,
+                batch_size=batch_size,
+                train_split=0.85
+            )
+            
+            train_loader = data_loader.get_train_loader()
+            val_loader = data_loader.get_val_loader()
+            
+            # Cache the loaders
+            self._data_loaders_cache[cache_key] = (train_loader, val_loader)
+            
+            print(f"✅ {stage_name} data prepared:")
+            print(f"   Training samples: {len(train_loader.dataset)}")
+            print(f"   Validation samples: {len(val_loader.dataset)}")
+            print(f"   Batch size: {batch_size}")
+        else:
+            print(f"Using cached data loaders for {stage_name}")
+        
+        return self._data_loaders_cache[cache_key]
+
+    def generate_training_curves(self, stage_results: Dict) -> None:
+        """
+        Generate comprehensive training curves for all stages
+        
+        Args:
+            stage_results: Dictionary containing results from all stages
+        """
+        print("\n📊 Generating Training Curves...")
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle(f'Progressive Training Curves - {self.experiment_name}', fontsize=16, fontweight='bold')
+        
+        # Colors for different stages
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+        stage_names = ['Stage 1', 'Stage 2', 'Stage 3', 'Stage 4']
+        
+        for stage_idx, (stage_name, stage_data) in enumerate(stage_results.items()):
+            if stage_data is None or 'history' not in stage_data:
+                continue
+                
+            history = stage_data['history']
+            color = colors[stage_idx]
+            
+            # Plot 1: Loss Curves
+            axes[0, 0].plot(history['train_loss'], label=f'{stage_name} Train', 
+                           color=color, linestyle='-', linewidth=2)
+            axes[0, 0].plot(history['val_loss'], label=f'{stage_name} Val', 
+                           color=color, linestyle='--', linewidth=2)
+            
+            # Plot 2: Accuracy Curves
+            axes[0, 1].plot(history['train_acc'], label=f'{stage_name} Train', 
+                           color=color, linestyle='-', linewidth=2)
+            axes[0, 1].plot(history['val_acc'], label=f'{stage_name} Val', 
+                           color=color, linestyle='--', linewidth=2)
+            
+            # Plot 3: Learning Rate
+            if 'lr' in history:
+                axes[1, 0].plot(history['lr'], label=stage_name, 
+                               color=color, linewidth=2)
+            
+            # Plot 4: Train/Val Gap (Overfitting Detection)
+            train_val_gap = [abs(t - v) for t, v in zip(history['train_acc'], history['val_acc'])]
+            axes[1, 1].plot(train_val_gap, label=stage_name, 
+                           color=color, linewidth=2)
+        
+        # Customize plots
+        axes[0, 0].set_title('Loss Curves', fontweight='bold')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        axes[0, 1].set_title('Accuracy Curves', fontweight='bold')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Accuracy (%)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        axes[1, 0].set_title('Learning Rate Schedule', fontweight='bold')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Learning Rate')
+        axes[1, 0].legend()
+        axes[1, 0].set_yscale('log')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        axes[1, 1].set_title('Train/Val Gap (Overfitting Detection)', fontweight='bold')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Accuracy Gap (%)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Add threshold line for overfitting
+        threshold = TRAINING_CONFIG.get('OVERFIT_THRESHOLD', 3)
+        axes[1, 1].axhline(y=threshold, color='red', linestyle='--', 
+                           alpha=0.7, label=f'Threshold ({threshold}%)')
+        axes[1, 1].legend()
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        plot_path = f'logs/{self.experiment_name}/training_curves.png'
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"📈 Training curves saved to: {plot_path}")
+        
+        # Also save as interactive HTML
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            
+            # Create interactive plot
+            fig_interactive = make_subplots(
+                rows=2, cols=2,
+                subplot_titles=('Loss Curves', 'Accuracy Curves', 
+                              'Learning Rate Schedule', 'Train/Val Gap'),
+                specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                       [{"secondary_y": False}, {"secondary_y": False}]]
+            )
+            
+            for stage_idx, (stage_name, stage_data) in enumerate(stage_results.items()):
+                if stage_data is None or 'history' not in stage_data:
+                    continue
+                    
+                history = stage_data['history']
+                color = colors[stage_idx]
+                
+                # Add traces for each subplot
+                fig_interactive.add_trace(
+                    go.Scatter(y=history['train_loss'], name=f'{stage_name} Train Loss',
+                             line=dict(color=color, width=2)), row=1, col=1)
+                fig_interactive.add_trace(
+                    go.Scatter(y=history['val_loss'], name=f'{stage_name} Val Loss',
+                             line=dict(color=color, width=2, dash='dash')), row=1, col=1)
+                
+                fig_interactive.add_trace(
+                    go.Scatter(y=history['train_acc'], name=f'{stage_name} Train Acc',
+                             line=dict(color=color, width=2)), row=1, col=2)
+                fig_interactive.add_trace(
+                    go.Scatter(y=history['val_acc'], name=f'{stage_name} Val Acc',
+                             line=dict(color=color, width=2, dash='dash')), row=1, col=2)
+                
+                if 'lr' in history:
+                    fig_interactive.add_trace(
+                        go.Scatter(y=history['lr'], name=f'{stage_name} LR',
+                                 line=dict(color=color, width=2)), row=2, col=1)
+                
+                train_val_gap = [abs(t - v) for t, v in zip(history['train_acc'], history['val_acc'])]
+                fig_interactive.add_trace(
+                    go.Scatter(y=train_val_gap, name=f'{stage_name} Gap',
+                             line=dict(color=color, width=2)), row=2, col=2)
+            
+            # Update layout
+            fig_interactive.update_layout(
+                title=f'Progressive Training Curves - {self.experiment_name}',
+                height=800,
+                showlegend=True
+            )
+            
+            # Save interactive plot
+            html_path = f'logs/{self.experiment_name}/training_curves_interactive.html'
+            fig_interactive.write_html(html_path)
+            print(f"📊 Interactive training curves saved to: {html_path}")
+            
+        except ImportError:
+            print("⚠️  Plotly not available, skipping interactive plot generation")
+        
+        plt.close()
 
 
-def run_progressive_training():
+def run_progressive_training(experiment_name=None):
     """Run progressive training with enhanced logging"""
     from src.models.cnn_model import CandleCNN
     from config.config import MODEL_CONFIG
@@ -933,8 +1111,14 @@ def run_progressive_training():
     device = MODEL_CONFIG['DEVICE']
     model = model.to(device)
     
-    # Initialize progressive trainer
-    trainer = ProgressiveTrainer(model, device=device)
+    # Verify model is on correct device
+    print(f"Model device: {next(model.parameters()).device}")
+    
+    # Initialize progressive trainer with experiment name
+    trainer = ProgressiveTrainer(model, device=device, experiment_name=experiment_name)
+    
+    # Verify trainer model is on correct device
+    print(f"Trainer model device: {next(trainer.model.parameters()).device}")
     
     # Run progressive training
     results = trainer.train_progressive()
