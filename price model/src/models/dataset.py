@@ -5,7 +5,8 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from config.config import SEQ_LEN
+# from config.config import SEQ_LEN  # Will use parameter instead
+SEQ_LEN = 5  # Default sequence length
 
 
 class FinancialDataset(Dataset):
