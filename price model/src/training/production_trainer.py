@@ -25,8 +25,9 @@ warnings.filterwarnings("ignore")
 # Add src to path
 sys.path.append('.')
 
-from src.models.advanced_time_series_integration import create_gpt2_enhanced_cnn
 from src.models.dataset import FinancialDataset
+from src.training.losses import FocalLoss
+from src.models.timesnet_hybrid import create_timesnet_hybrid
 
 # PROFESSIONAL ENHANCEMENTS - NEW PERFORMANCE FEATURES
 try:
@@ -57,9 +58,13 @@ class EnhancedCNNProductionTrainer:
         
         # Separate learning rates for different components
         self.optimizer = self._create_optimizer()
+        # Cosine scheduler with 10% warm-up
+        self.total_epochs = None
+        self.scheduler = None
+        self.cosine_scheduler = None
         
         # Loss function
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = FocalLoss(gamma=1.5)
         
         # Training history
         self.train_losses = []
@@ -67,9 +72,9 @@ class EnhancedCNNProductionTrainer:
         self.train_accuracies = []
         self.val_accuracies = []
         
-        # Early stopping
-        self.best_val_loss = float('inf')
-        self.patience = 10
+        # Early stopping on accuracy
+        self.best_val_acc = 0.0
+        self.patience = 3
         self.patience_counter = 0
         
         print(f"🤖 Enhanced CNN Production Trainer initialized on {device}")
@@ -80,12 +85,12 @@ class EnhancedCNNProductionTrainer:
     
     def _analyze_components(self):
         """Analyze model components for monitoring"""
-        gpt2_params = sum(p.numel() for name, p in self.model.named_parameters() if 'gpt2_extractor' in name)
+        gpt2_params = sum(p.numel() for name, p in self.model.named_parameters() if 'timesnet' in name)
         cnn_params = sum(p.numel() for name, p in self.model.named_parameters() if 'enhanced_cnn' in name)
         classifier_params = sum(p.numel() for name, p in self.model.named_parameters() if 'classifier' in name)
         
         print(f"🔍 Model Component Analysis:")
-        print(f"  🧠 GPT-2 Extractor: {gpt2_params:,} parameters")
+        print(f"  🧠 TimesNet Encoder: {gpt2_params:,} parameters")
         print(f"  🎯 Enhanced CNN: {cnn_params:,} parameters")
         print(f"  🎨 Classifier: {classifier_params:,} parameters")
         print(f"  📊 Total: {gpt2_params + cnn_params + classifier_params:,} parameters")
@@ -99,9 +104,9 @@ class EnhancedCNNProductionTrainer:
         classifier_params = []
         
         for name, param in self.model.named_parameters():
-            if 'gpt2_extractor' in name:
+            if 'timesnet' in name:
                 gpt2_params.append(param)
-            elif 'enhanced_cnn' in name:
+            elif 'cnn' in name:
                 cnn_params.append(param)
             elif 'classifier' in name:
                 classifier_params.append(param)
@@ -111,13 +116,13 @@ class EnhancedCNNProductionTrainer:
         
         # Different learning rates for different components
         optimizer = optim.AdamW([
-            {'params': gpt2_params, 'lr': self.learning_rate * 0.1},  # Lower LR for GPT-2
+            {'params': gpt2_params, 'lr': self.learning_rate * 0.1},  # Lower LR for TimesNet
             {'params': cnn_params, 'lr': self.learning_rate * 1.5},    # Higher LR for CNN
             {'params': classifier_params, 'lr': self.learning_rate}     # Standard LR for classifier
         ], weight_decay=self.weight_decay)
         
         print(f"⚙️  Optimizer Configuration:")
-        print(f"  🧠 GPT-2 LR: {self.learning_rate * 0.1:.6f} (0.1x)")
+        print(f"  🧠 TimesNet LR: {self.learning_rate * 0.1:.6f} (0.1x)")
         print(f"  🎯 CNN LR: {self.learning_rate * 1.5:.6f} (1.5x)")
         print(f"  🎨 Classifier LR: {self.learning_rate:.6f} (1.0x)")
         print(f"  📉 Weight Decay: {self.weight_decay}")
@@ -149,6 +154,9 @@ class EnhancedCNNProductionTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
+                self.cosine_scheduler.step()
             
             # Statistics
             total_loss += loss.item()
@@ -211,6 +219,14 @@ class EnhancedCNNProductionTrainer:
         os.makedirs(save_dir, exist_ok=True)
         
         print(f"🚀 Starting production training for {epochs} epochs...")
+        # Setup cosine scheduler with warm-up
+        self.total_epochs = epochs
+        steps_per_epoch = len(train_loader)
+        warmup_steps = max(1, int(0.1 * epochs * steps_per_epoch))
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+        cosine = CosineAnnealingLR(self.optimizer, T_max=epochs*steps_per_epoch)
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, step / warmup_steps))
+        self.cosine_scheduler = cosine
         print(f"📊 Training samples: {len(train_loader.dataset):,}")
         print(f"📊 Validation samples: {len(val_loader.dataset):,}")
         print(f"💾 Save directory: {save_dir}")
@@ -252,13 +268,12 @@ class EnhancedCNNProductionTrainer:
             # Print streamlined progress
             print(f"📊 Epoch {epoch+1}/{epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
             
-            # Early stopping
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+                    # Early stopping based on accuracy only
+        if val_acc > getattr(self, 'best_val_acc', 0):
+                self.best_val_acc = val_acc
                 self.patience_counter = 0
-                
-                # Save best model
-                best_model_path = os.path.join(save_dir, 'enhanced_cnn_best.pth')
+
+                best_model_path = os.path.join(save_dir, 'best_acc_model.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
@@ -268,9 +283,8 @@ class EnhancedCNNProductionTrainer:
                     'train_acc': train_acc,
                     'val_acc': val_acc,
                 }, best_model_path)
-                print(f"  ✅ Saved best model")
-                
-            else:
+                print(f"  ✅ Saved new best-accuracy model: {val_acc:.2f}%")
+        else:
                 self.patience_counter += 1
                 print(f"  ⚠️  No improvement for {self.patience_counter} epochs")
             
@@ -302,7 +316,7 @@ class EnhancedCNNProductionTrainer:
             'val_losses': self.val_losses,
             'train_accuracies': self.train_accuracies,
             'val_accuracies': self.val_accuracies,
-            'best_val_loss': self.best_val_loss,
+            'best_val_acc': self.best_val_acc,
             'epochs_trained': len(self.train_losses),
             'total_training_time': total_time,
             'average_epoch_time': total_time / len(self.train_losses)
@@ -354,11 +368,18 @@ def load_data_and_create_loaders(csv_path: str = "data/reduced_feature_set_datas
     # Create dataset
     dataset = FinancialDataset(X, y)
     
-    # Split dataset
-    print(f"✂️  Splitting data (test_size={test_size})...")
-    train_size = int((1 - test_size) * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # Rolling-window split (70:15:15) no shuffling
+    print("✂️  Rolling-window split 70:15:15 (train:val:test)…")
+    total_len = len(dataset)
+    train_end = int(0.70 * total_len)
+    val_end = int(0.85 * total_len)
+    indices = list(range(total_len))
+    train_indices = indices[:train_end]
+    val_indices = indices[train_end:val_end]
+    test_indices = indices[val_end:]
+    from torch.utils.data import Subset
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -399,21 +420,23 @@ def run_production_training(csv_path: str = "data/reduced_feature_set_dataset.cs
     # Load data
     train_loader, val_loader = load_data_and_create_loaders(csv_path, batch_size)
     
-    # Create model
-    print(f"🤖 Creating enhanced GPT-2 CNN model...")
-    
-    # Calculate features per day from actual data
+    # ----- Model Selection -----
+    MODEL_TYPE = "timesnet_hybrid"  # Change if needed
+    print(f"🤖 Creating model: {MODEL_TYPE} ...")
+
+    # Calculate features per day from dataset
     df_temp = pd.read_csv(csv_path)
     feature_cols_temp = [col for col in df_temp.columns if col not in ['Ticker', 'Label']]
-    features_per_day = len(feature_cols_temp) // 5  # 5-day sequences
+    features_per_day = len(feature_cols_temp) // 5
     print(f"📊 Auto-detected features per day: {features_per_day}")
-    
-    model = create_gpt2_enhanced_cnn(
-        features_per_day=features_per_day,  # Use actual dataset features
-        hidden_size=768,
-        num_classes=5,
-        fusion_method=fusion_method
-    )
+
+    if MODEL_TYPE == "timesnet_hybrid":
+        model = create_timesnet_hybrid(features_per_day=features_per_day, num_classes=5)
+    elif MODEL_TYPE == "simple_cnn":
+        from src.training.simple_cnn_trainer import SimpleCNN
+        model = SimpleCNN(features_per_day=features_per_day, num_classes=5)
+    else:
+        raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
     
     # Create trainer
     trainer = EnhancedCNNProductionTrainer(

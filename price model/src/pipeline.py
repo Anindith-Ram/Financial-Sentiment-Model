@@ -134,7 +134,7 @@ def show_status():
         "Research Trainer": project_root / "src" / "training" / "research_trainer.py",
         "Production Trainer": project_root / "src" / "training" / "production_trainer.py", 
         "Data Collection": project_root / "src" / "data" / "data_collection.py", 
-        "Model Architecture": project_root / "src" / "models" / "advanced_time_series_integration.py",
+        "Model Architecture": project_root / "src" / "models" / "timesnet_hybrid.py",
         "Dataset Handler": project_root / "src" / "models" / "dataset.py",
         "Professional Optimizers": project_root / "src" / "training" / "optimizers.py",
         "Advanced Schedulers": project_root / "src" / "training" / "schedulers.py",
