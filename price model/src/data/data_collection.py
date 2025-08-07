@@ -28,6 +28,7 @@ from typing import List, Dict, Any, Tuple
 import json
 from tqdm import tqdm
 import logging
+import time
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
@@ -46,6 +47,18 @@ except ImportError:
     PROFESSIONAL_FEATURES = False
 
 warnings.filterwarnings('ignore')
+
+# --- Ensure Windows-safe ASCII logging (strip non-ASCII to avoid UnicodeEncodeError) ---
+def _strip_non_ascii(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    return text.encode('ascii', 'ignore').decode('ascii')
+
+class _AsciiAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return _strip_non_ascii(msg), kwargs
+
+logger = _AsciiAdapter(logger, {})
 
 
 class ProfessionalDataCollector:
@@ -80,7 +93,59 @@ class ProfessionalDataCollector:
     def _get_default_tickers(self) -> List[str]:
         """Get default list of tickers"""
         
-        # Try to load from CSV if it exists
+        # First priority: Try to load from constituents.csv
+        constituents_file = self.project_root / "data" / "constituents.csv"
+        if constituents_file.exists():
+            try:
+                import pandas as pd
+                df = pd.read_csv(constituents_file)
+                col = next((c for c in df.columns if c.lower() in ["ticker","symbol","Ticker","Symbol"]), "Symbol")
+                tickers = df[col].astype(str).str.upper().str.replace("\.", "-")  # BRK.B → BRK-B
+                tickers = tickers.dropna().unique().tolist()
+                logger.info(f"📋 Loaded {len(tickers)} S&P 500 tickers from constituents.csv")
+                return tickers
+            except Exception as e:
+                logger.warning(f"Could not load S&P 500 tickers from constituents.csv: {e}")
+        
+        # Second priority: Try to fetch current S&P500 membership from Wikipedia
+        try:
+            import pandas as pd
+            tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+            sp = tables[0]
+            sym_col = next((c for c in sp.columns if str(c).lower().startswith('symbol')), sp.columns[0])
+            tickers = (
+                sp[sym_col]
+                .astype(str)
+                .str.upper()
+                .str.replace('\.', '-', regex=False)  # BRK.B -> BRK-B
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            if len(tickers) >= 450:
+                logger.info(f"📋 Loaded {len(tickers)} S&P 500 tickers from Wikipedia (backup)")
+                return tickers
+        except Exception as e:
+            logger.info(f"Could not fetch S&P 500 from Wikipedia; will try other sources. Reason: {e}")
+
+        # Third priority: Try other local CSV files
+        sp500_files = [
+            self.project_root / "data" / "tickers_sp500.csv",
+            self.project_root / "data" / "sp500_tickers.csv",
+            self.project_root / "data" / "sp500_constituents.csv",
+        ]
+        for f in sp500_files:
+            if f.exists():
+                try:
+                    df = pd.read_csv(f)
+                    col = next((c for c in df.columns if c.lower() in ["ticker","symbol","Ticker","Symbol"]), "Ticker")
+                    tickers = df[col].astype(str).str.upper().str.replace("\.", "-")  # BRK.B → BRK-B
+                    tickers = tickers.dropna().unique().tolist()
+                    logger.info(f"📋 Loaded {len(tickers)} S&P 500 tickers from {f.name}")
+                    return tickers
+                except Exception as e:
+                    logger.warning(f"Could not load S&P 500 tickers from {f.name}: {e}")
+        
         tickers_file = self.project_root / "data" / "tickers.csv"
         if tickers_file.exists():
             try:
@@ -129,7 +194,15 @@ class ProfessionalDataCollector:
             # Ensure proper column names
             df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits', 'Ticker']
             
-            # Remove unnecessary columns
+            # Prefer adjusted OHLC if available
+            try:
+                hist = stock.history(start=start_date, end=end_date, auto_adjust=True)
+                if not hist.empty and 'Close' in hist.columns:
+                    df = hist.reset_index()[['Date','Open','High','Low','Close','Volume']]
+                    df['Ticker'] = ticker
+            except Exception:
+                pass
+            # Ensure necessary columns
             df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Ticker']]
             
             logger.debug(f"✅ Collected {len(df)} rows for {ticker}")
@@ -206,12 +279,22 @@ class ProfessionalDataCollector:
             logger.debug(f"✅ Calculated technical indicators")
             
         except Exception as e:
-            logger.error(f"❌ Error calculating indicators: {e}")
+            # Cast arrays to float64 for ta-lib compatibility and retry key indicators
+            try:
+                open_price = open_price.astype('float64')
+                high_price = high_price.astype('float64')
+                low_price = low_price.astype('float64')
+                close_price = close_price.astype('float64')
+                volume = volume.astype('float64')
+                if len(data) >= 20:
+                    data['obv'] = talib.OBV(close_price, volume)
+            except Exception as e2:
+                logger.error(f"Indicator fallback failed: {e2}")
         
         return data
     
     def create_sequences(self, df: pd.DataFrame, sequence_length: int = 5) -> pd.DataFrame:
-        """Create sequences and labels for training"""
+        """Create sequences and 3-class labels (rolling 33/66%) per ticker."""
         
         if len(df) < sequence_length + 1:
             logger.warning(f"⚠️ Insufficient data for sequences: {len(df)} < {sequence_length + 1}")
@@ -219,34 +302,34 @@ class ProfessionalDataCollector:
         
         sequences = []
         
-        # Get feature columns (exclude metadata)
-        feature_cols = [col for col in df.columns if col not in ['Date', 'Ticker']]
+        # Compute next-day return and rolling thresholds (use past info only)
+        df = df.sort_values('Date').copy()
+        df['ret1'] = df['Close'].pct_change().shift(-1)
+        past_ret = df['ret1'].shift(1)
+        q33 = past_ret.rolling(252, min_periods=60).quantile(0.33)
+        q66 = past_ret.rolling(252, min_periods=60).quantile(0.66)
+        label3 = np.where(df['ret1'] < q33, 0, np.where(df['ret1'] > q66, 2, 1)).astype(int)
+        # Early region fallback
+        med = past_ret.rolling(60, min_periods=20).median()
+        mask = q33.isna() | q66.isna()
+        label3 = np.array(label3)
+        if mask.any():
+            label3[mask.values] = np.where(df.loc[mask, 'ret1'] < med[mask], 0, 2)
+        label3 = np.where(df['ret1'].isna(), 1, label3)
+
+        # Get feature columns (exclude metadata & the new helper columns)
+        feature_cols = [col for col in df.columns if col not in ['Date', 'Ticker', 'ret1']]
         
         for i in range(len(df) - sequence_length):
             # Get sequence data
             sequence_data = df.iloc[i:i+sequence_length][feature_cols].values.flatten()
             
-            # Calculate label (price direction for next day)
-            current_close = df.iloc[i+sequence_length-1]['Close']
-            next_close = df.iloc[i+sequence_length]['Close']
-            
-            # 5-class labeling
-            pct_change = (next_close - current_close) / current_close
-            
-            if pct_change <= -0.02:
-                label = 0  # Strong Down
-            elif pct_change <= -0.005:
-                label = 1  # Down
-            elif pct_change <= 0.005:
-                label = 2  # Neutral
-            elif pct_change <= 0.02:
-                label = 3  # Up
-            else:
-                label = 4  # Strong Up
+            # 3-class label from rolling quantiles
+            label = int(label3[i+sequence_length])
             
             # Create sequence record
             sequence_record = {f'feature_{j}': val for j, val in enumerate(sequence_data)}
-            sequence_record['Label'] = label
+            sequence_record['Label'] = label  # 0/1/2
             sequence_record['Ticker'] = df.iloc[i+sequence_length]['Ticker']
             
             sequences.append(sequence_record)
@@ -301,12 +384,15 @@ class ProfessionalDataCollector:
         logger.info("🔗 Combining sequences...")
         final_dataset = pd.concat(all_sequences, ignore_index=True)
         
-        # Remove rows with NaN values
+        # Smart NaN handling: drop only rows missing core OHLCV, keep rows with missing secondary indicators
+        core_cols = [c for c in final_dataset.columns if c.startswith('feature_')]  # sequence features only
         initial_count = len(final_dataset)
-        final_dataset = final_dataset.dropna()
+        # Identify OHLCV-derived slots if available (robust fallback: require at least 80% of features present)
+        non_na_ratio = final_dataset[core_cols].notna().mean(axis=1)
+        final_dataset = final_dataset[non_na_ratio >= 0.8].copy()
+        final_dataset = final_dataset.dropna(subset=['Label','Ticker'])
         final_count = len(final_dataset)
-        
-        logger.info(f"🧹 Removed {initial_count - final_count:,} rows with NaN values")
+        logger.info(f"🧹 Removed {initial_count - final_count:,} rows after 80% feature coverage filter")
         logger.info(f"✅ Final dataset: {final_count:,} samples")
         
         # Save dataset to correct location

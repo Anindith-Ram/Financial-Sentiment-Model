@@ -56,92 +56,106 @@ except ImportError as e:
 
 def load_and_preprocess_data(csv_path: str = "data/reduced_feature_set_dataset.csv", 
                            test_size: float = 0.2, random_state: int = 42) -> tuple:
-    """Load and preprocess data for enhanced training"""
-    
+    """Load data, generate 3-class labels with rolling 33/66% per ticker, robust-scale per ticker, split by time if Date present."""
+
     print(f"📊 Loading data from {csv_path}...")
     df = pd.read_csv(csv_path)
-    
-    # Separate features and labels - exclude Ticker and Label columns
-    feature_columns = [col for col in df.columns if col not in ['Ticker', 'Label']]
-    
-    # Handle NaN values before training
+
+    # Identify potential date col and close column
+    date_col = next((c for c in ["Date","date","Timestamp","timestamp"] if c in df.columns), None)
+    close_col = next((c for c in ["Close","Adj Close","Adj_Close"] if c in df.columns), None)
+
+    # Build feature list excluding non-features
+    feature_columns = [c for c in df.columns if c not in ["Ticker","Label"]]
+    if date_col:
+        feature_columns = [c for c in feature_columns if c != date_col]
+
     print(f"🔍 Checking for NaN values...")
     nan_rows = df[feature_columns].isna().any(axis=1)
+    df_clean = df[~nan_rows].copy() if nan_rows.any() else df.copy()
     if nan_rows.any():
-        nan_count = nan_rows.sum()
-        print(f"⚠️  Found {nan_count:,} rows with NaN values ({nan_count/len(df)*100:.2f}%)")
-        print(f"🧹 Removing NaN rows for training...")
-        df_clean = df[~nan_rows].copy()
-        print(f"✅ Clean dataset: {len(df_clean):,} rows")
+        print(f"⚠️  Removed {nan_rows.sum():,} rows with NaN values")
+
+    # Generate 3-class labels
+    if date_col and close_col:
+        df_clean = df_clean.sort_values(["Ticker", date_col])
+        df_clean["ret1"] = df_clean.groupby("Ticker")[close_col].pct_change().shift(-1)
+        past_ret = df_clean.groupby("Ticker")["ret1"].shift(1)
+        q33 = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(252, min_periods=60).quantile(0.33))
+        q66 = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(252, min_periods=60).quantile(0.66))
+        labels_3 = np.where(df_clean["ret1"] < q33, 0, np.where(df_clean["ret1"] > q66, 2, 1))
+        nan_mask = np.isnan(q33) | np.isnan(q66)
+        if nan_mask.any():
+            med = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(60, min_periods=20).median())
+            labels_3[nan_mask] = np.where(df_clean.loc[nan_mask, "ret1"] < med[nan_mask], 0, 2)
+            labels_3 = np.where(np.isnan(df_clean["ret1"]) & nan_mask, 1, labels_3)
+        df_clean["Label_3"] = labels_3.astype(np.int64)
+        target_col = "Label_3"
     else:
-        df_clean = df.copy()
-        print(f"✅ No NaN values found")
-    
-    X = df_clean[feature_columns].values.astype(np.float32)
-    y = df_clean['Label'].values.astype(np.int64)
-    
-    print(f"📈 Dataset shape: {X.shape}")
-    print(f"🔢 Features per sample: {X.shape[1]}")
-    
-    # Analyze class distribution
-    unique_classes, class_counts = np.unique(y, return_counts=True)
-    print(f"\n🎯 Class Distribution Analysis:")
-    total_samples = len(y)
-    for cls, count in zip(unique_classes, class_counts):
-        percentage = count / total_samples * 100
-        print(f"  Class {cls}: {count:,} samples ({percentage:.1f}%)")
-    
-    # Calculate moderated class weights to prevent gradient explosion
-    raw_weights = len(y) / (len(unique_classes) * class_counts)
-    
-    # Cap maximum weight to prevent extreme values (max 3x, min 0.5x)
-    max_weight = 3.0
-    min_weight = 0.5
-    class_weights = np.clip(raw_weights, min_weight, max_weight)
-    
-    print(f"\n⚖️ Moderated class weights (capped for stability):")
-    for cls, raw_w, mod_w in zip(unique_classes, raw_weights, class_weights):
-        print(f"  Class {cls}: {raw_w:.3f} → {mod_w:.3f} (moderated)")
-    
-    # Handle extreme feature scaling - CRITICAL FIX
-    print(f"\n🔧 Feature Scaling Analysis:")
-    print(f"  Before scaling - Min: {X.min():.2e}, Max: {X.max():.2e}")
-    print(f"  Range: {X.max() - X.min():.2e}")
-    
-    # Use RobustScaler to handle outliers and extreme values
+        # Fallback mapping 5→3 classes
+        if 'Label' not in df_clean.columns:
+            raise ValueError("No Label and no price columns to compute 3-class labels.")
+        map3 = {0:0,1:0,2:1,3:2,4:2}
+        df_clean['Label_3'] = df_clean['Label'].map(map3).astype(np.int64)
+        target_col = 'Label_3'
+
+    # Time-aware split per ticker if possible
+    if date_col:
+        train_parts, test_parts = [], []
+        for tkr, g in df_clean.groupby('Ticker'):
+            g = g.sort_values(date_col)
+            n = len(g)
+            split_idx = int(n * (1 - test_size))
+            train_parts.append(g.iloc[:split_idx])
+            test_parts.append(g.iloc[split_idx:])
+        train_df = pd.concat(train_parts)
+        test_df = pd.concat(test_parts)
+    else:
+        from sklearn.model_selection import train_test_split
+        train_df, test_df = train_test_split(df_clean, test_size=test_size, random_state=random_state, stratify=df_clean[target_col])
+
+    # Robust scale per ticker on train stats only
     from sklearn.preprocessing import RobustScaler
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
-    print(f"  After scaling - Min: {X_scaled.min():.3f}, Max: {X_scaled.max():.3f}")
-    print(f"  ✅ Feature scaling completed!")
-    
-    # Calculate features per day based on actual data
+    X_train_list, X_test_list, y_train_list, y_test_list = [], [], [], []
+    for tkr in sorted(set(train_df['Ticker'])):
+        tr = train_df[train_df['Ticker']==tkr]
+        te = test_df[test_df['Ticker']==tkr]
+        if len(tr)==0 or len(te)==0:
+            continue
+        scaler = RobustScaler()
+        Xtr = scaler.fit_transform(tr[feature_columns].values.astype(np.float32))
+        Xte = scaler.transform(te[feature_columns].values.astype(np.float32))
+        X_train_list.append(Xtr)
+        X_test_list.append(Xte)
+        y_train_list.append(tr[target_col].values.astype(np.int64))
+        y_test_list.append(te[target_col].values.astype(np.int64))
+
+    X_train = np.vstack(X_train_list)
+    X_test = np.vstack(X_test_list)
+    y_train = np.concatenate(y_train_list)
+    y_test = np.concatenate(y_test_list)
+
+    print(f"📈 Dataset shape (train/test): {X_train.shape} / {X_test.shape}")
+    print(f"🔢 Features per sample: {X_train.shape[1]}")
+
+    # Class weights (3-class)
+    uniq, cnts = np.unique(y_train, return_counts=True)
+    total = len(y_train)
+    raw_w = total / (len(uniq) * cnts)
+    class_weights = np.clip(raw_w, 0.5, 3.0)
+    print("\n⚖️ Moderated class weights:")
+    for c, rw, mw in zip(uniq, raw_w, class_weights):
+        print(f"  Class {c}: {rw:.3f} → {mw:.3f}")
+
+    # Sequence info
     seq_len = 5
-    features_per_day = X.shape[1] // seq_len
+    features_per_day = X_train.shape[1] // seq_len
     print(f"\n⏰ Sequence length: {seq_len}")
     print(f"🎯 Features per day: {features_per_day}")
-    print(f"🎯 Number of classes: {len(unique_classes)}")
-    
-    # Split data with stratification
-    print(f"\n✂️  Splitting data (test_size={test_size})...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=test_size, random_state=random_state, stratify=y
-    )
-    
-    print(f"✂️  Split completed:")
-    print(f"  🎯 Train: {X_train.shape}")
-    print(f"  🎯 Test: {X_test.shape}")
-    
-    # Reshape for sequences (data is already scaled)
-    X_train_reshaped = X_train.reshape(-1, seq_len, features_per_day)
-    X_test_reshaped = X_test.reshape(-1, seq_len, features_per_day)
-    
-    print(f"\n🔄 Reshaped data for sequences:")
-    print(f"  🎯 Train: {X_train_reshaped.shape}")
-    print(f"  🎯 Test: {X_test_reshaped.shape}")
-    print(f"  🎯 Features per day: {features_per_day}")
-    
-    return X_train_reshaped, X_test_reshaped, y_train, y_test, features_per_day, class_weights
+    print(f"🎯 Number of classes: 3")
+
+    # Return flat arrays; FinancialDataset reshapes internally
+    return X_train, X_test, y_train, y_test, features_per_day, class_weights
 
 
 class EnhancedCNNResearchTrainer:
@@ -274,8 +288,10 @@ class EnhancedCNNResearchTrainer:
         
         # 🛡️ ENHANCED REGULARIZATION SETUP
         # MixUp data augmentation - reduces overfitting by creating synthetic training examples
-        self.mixup = MixUp(alpha=0.2)  # Conservative alpha to maintain data integrity
-        self.mixup_prob = 0.5  # Apply MixUp to 50% of batches
+        self.mixup = MixUp(alpha=0.2)
+        self.cutmix = CutMix(alpha=0.2)
+        self.mixup_prob = 0.4
+        self.cutmix_prob = 0.2
         
         # Label Smoothing - prevents model from being overconfident
         self.label_smoothing = LabelSmoothing(smoothing=0.1)  # 10% smoothing
@@ -291,13 +307,12 @@ class EnhancedCNNResearchTrainer:
         print(f"  📋 Label Smoothing: 10% → Prevents overconfidence")
         print(f"  🔇 Input Noise: 1% strength → Improves robustness")
         
-        # 🚀 STOCHASTIC WEIGHT AVERAGING (SWA) for final accuracy boost
-        if self.use_swa:
-            self.swa_model = None  # Will be initialized during training
-            self.swa_start_epoch = 0.8  # Start SWA at 80% of training
-            self.swa_freq = 5  # Update SWA model every 5 epochs
-            self.swa_lr = 1e-4  # Lower LR for SWA phase
-            print(f"🚀 SWA enabled: starts at 80% training, updates every {self.swa_freq} epochs")
+        # 🚀 EMA weights instead of SWA
+        self.use_ema = True
+        if self.use_ema:
+            self.ema_decay = 0.999
+            self.ema_model = None
+            print(f"🚀 EMA enabled: decay={self.ema_decay}")
         
         # Training history
         self.train_losses = []
@@ -447,9 +462,12 @@ class EnhancedCNNResearchTrainer:
                 noise = torch.randn_like(data) * 0.01  # 1% noise strength
                 data = data + noise
             
-            # MixUp augmentation - creates synthetic training examples between classes
-            use_mixup = self.model.training and torch.rand(1) < self.mixup_prob
-            if use_mixup:
+            # MixUp / CutMix augmentation
+            use_cutmix = self.model.training and torch.rand(1) < self.cutmix_prob
+            use_mixup = not use_cutmix and self.model.training and torch.rand(1) < self.mixup_prob
+            if use_cutmix:
+                data, target_a, target_b, lam = self.cutmix(data, target)
+            elif use_mixup:
                 data, target_a, target_b, lam = self.mixup(data, target)
             else:
                 target_a, target_b, lam = target, None, 1.0
@@ -462,7 +480,7 @@ class EnhancedCNNResearchTrainer:
                     output = self.model(data)
                     
                     # Enhanced loss calculation with regularization
-                    if use_mixup:
+                    if use_mixup or use_cutmix:
                         # MixUp loss: weighted combination of two targets
                         loss_a = self.label_smoothing(output, target_a)
                         loss_b = self.label_smoothing(output, target_b)
@@ -480,6 +498,17 @@ class EnhancedCNNResearchTrainer:
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                # EMA update (after optimizer step)
+                if self.use_ema:
+                    if self.ema_model is None:
+                        from copy import deepcopy
+                        self.ema_model = deepcopy(self.model).to(self.device)
+                        for p in self.ema_model.parameters():
+                            p.requires_grad_(False)
+                    with torch.no_grad():
+                        for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
+                            ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
                 
                 # Step scheduler for OneCycleLR (per batch) - mixed precision path
                 if self.scheduler_mode == "onecycle":
@@ -490,7 +519,7 @@ class EnhancedCNNResearchTrainer:
                 output = self.model(data)
                 
                 # Enhanced loss calculation with regularization
-                if use_mixup:
+                if use_mixup or use_cutmix:
                     # MixUp loss: weighted combination of two targets
                     loss_a = self.label_smoothing(output, target_a)
                     loss_b = self.label_smoothing(output, target_b)
@@ -504,6 +533,17 @@ class EnhancedCNNResearchTrainer:
                 # Tighter gradient clipping to prevent explosion
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)  # Reduced from 0.3 → Tighter gradient control
                 self.optimizer.step()
+
+                # EMA update (standard precision path)
+                if self.use_ema:
+                    if self.ema_model is None:
+                        from copy import deepcopy
+                        self.ema_model = deepcopy(self.model).to(self.device)
+                        for p in self.ema_model.parameters():
+                            p.requires_grad_(False)
+                    with torch.no_grad():
+                        for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
+                            ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
             
             # Step scheduler for OneCycleLR (per batch)
             if self.scheduler_mode == "onecycle":
@@ -536,7 +576,9 @@ class EnhancedCNNResearchTrainer:
     
     def validate(self, val_loader: DataLoader) -> tuple:
         """Validate the model"""
-        self.model.eval()
+        # Use EMA weights if available
+        model_for_eval = self.ema_model if getattr(self, 'use_ema', False) and self.ema_model is not None else self.model
+        model_for_eval.eval()
         total_loss = 0
         correct = 0
         total = 0
@@ -547,7 +589,7 @@ class EnhancedCNNResearchTrainer:
         with torch.no_grad():
             for data, target in pbar:
                 data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
+                output = model_for_eval(data)
                 loss = self.criterion(output, target)
                 
                 total_loss += loss.item()
@@ -1122,7 +1164,7 @@ def main():
     # ============================================================
     # These settings use the proven adaptive scheduler that achieved 53.7%
     # Combined with extended training and enhanced regularization for 60%+ target
-    batch_size = 128              # Reduced from 64 → Better generalization with smaller batches
+    batch_size = 256              # Larger effective batch for stability; use AMP and gradient clipping
     epochs = 150                 # Extended for proven adaptive method → Should reach 55-60% faster
     learning_rate = 2.8e-4       # Set to your observed optimal value → Adaptive scheduler will build on this
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
@@ -1178,10 +1220,10 @@ def main():
     # 🔄 CHECKPOINT LOADING CONFIGURATION
     # =====================================
     # Option 1: Resume from 53.7% accuracy model (RECOMMENDED)
-    checkpoint_path = save_dir / "enhanced_cnn_best_20250806_134338.pth"
+    #checkpoint_path = save_dir / "enhanced_cnn_best_20250806_134338.pth"
     
     # Option 2: Start fresh training (uncomment line below)
-    # checkpoint_path = None
+    checkpoint_path = None
     
     # Option 3: Resume from different checkpoint (modify path below)  
     # checkpoint_path = save_dir / "enhanced_cnn_best_YYYYMMDD_HHMMSS.pth"
@@ -1202,10 +1244,10 @@ def main():
     elif MODEL_TYPE == "timesnet_hybrid":
         model = create_timesnet_hybrid(
             features_per_day=features_per_day,
-            num_classes=5,
-            cnn_channels=256,
-            timesnet_emb=384,
-            timesnet_depth=4
+            num_classes=3,
+            cnn_channels=512,
+            timesnet_emb=512,
+            timesnet_depth=5
         )
     elif MODEL_TYPE == "simple_cnn":
         from src.training.simple_cnn_trainer import SimpleCNN  # Lazy import

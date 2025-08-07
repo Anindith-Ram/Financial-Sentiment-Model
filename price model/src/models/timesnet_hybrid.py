@@ -129,9 +129,9 @@ class TimesNetEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 class TimesNetHybrid(nn.Module):
     def __init__(self, features_per_day: int = 62, num_classes: int = 5,
-                 cnn_channels: int = 256, timesnet_emb: int = 384, timesnet_depth: int = 4):
+                 cnn_channels: int = 512, timesnet_emb: int = 512, timesnet_depth: int = 5):
         super().__init__()
-        self.cnn = MultiScaleCNN(features_per_day, out_channels=cnn_channels)  # ➜ 3*cnn_channels-d
+        self.cnn = MultiScaleCNN(features_per_day, out_channels=cnn_channels)  # ➜ 3*cnn_channels-d (bigger)
         self.timesnet = TimesNetEncoder(in_features=features_per_day, emb_dim=timesnet_emb, depth=timesnet_depth)
         fused_dim = cnn_channels * 3  # from MultiScaleCNN concat
         times_dim = timesnet_emb
@@ -140,13 +140,13 @@ class TimesNetHybrid(nn.Module):
             nn.Sigmoid()
         )
         self.classifier = nn.Sequential(
-            nn.Linear(fused_dim, 256),
+            nn.Linear(fused_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_classes)
+            nn.Linear(512, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -164,7 +164,7 @@ class TimesNetHybrid(nn.Module):
 # ---------------------------------------------------------------------------
 
 def create_timesnet_hybrid(features_per_day: int = 62, num_classes: int = 5,
-                            cnn_channels: int = 256, timesnet_emb: int = 384, timesnet_depth: int = 4):
+                            cnn_channels: int = 512, timesnet_emb: int = 512, timesnet_depth: int = 5):
     """Factory that allows passing bigger model hyperparameters."""
     return TimesNetHybrid(features_per_day=features_per_day, num_classes=num_classes,
                           cnn_channels=cnn_channels, timesnet_emb=timesnet_emb, timesnet_depth=timesnet_depth)
