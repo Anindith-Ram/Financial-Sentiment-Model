@@ -180,7 +180,7 @@ class EnhancedCNNResearchTrainer:
         self.patience_counter = 0
         
         # 🎯 LEARNING RATE STRATEGY 
-        self.lr_strategy = 'adaptive'  # Revert to proven fast method
+        self.lr_strategy = 'onecycle'  # Regular OneCycleLR schedule (aggressive off)
         self.use_swa = True  # Enable Stochastic Weight Averaging for final accuracy boost
         
         # Mixed precision training for better performance
@@ -1122,8 +1122,8 @@ def main():
     # ============================================================
     # These settings use the proven adaptive scheduler that achieved 53.7%
     # Combined with extended training and enhanced regularization for 60%+ target
-    batch_size = 32              # Reduced from 64 → Better generalization with smaller batches
-    epochs = 100                 # Extended for proven adaptive method → Should reach 55-60% faster
+    batch_size = 128              # Reduced from 64 → Better generalization with smaller batches
+    epochs = 150                 # Extended for proven adaptive method → Should reach 55-60% faster
     learning_rate = 2.8e-4       # Set to your observed optimal value → Adaptive scheduler will build on this
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
     test_size = 0.2
@@ -1173,7 +1173,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # ----- Model Selection -----
-    MODEL_TYPE = "optimized_timesnet_hybrid"  # Using optimized version to prevent overfitting
+    MODEL_TYPE = "timesnet_hybrid"  # Using optimized version to prevent overfitting
     
     # 🔄 CHECKPOINT LOADING CONFIGURATION
     # =====================================
@@ -1202,7 +1202,10 @@ def main():
     elif MODEL_TYPE == "timesnet_hybrid":
         model = create_timesnet_hybrid(
             features_per_day=features_per_day,
-            num_classes=5
+            num_classes=5,
+            cnn_channels=256,
+            timesnet_emb=384,
+            timesnet_depth=4
         )
     elif MODEL_TYPE == "simple_cnn":
         from src.training.simple_cnn_trainer import SimpleCNN  # Lazy import

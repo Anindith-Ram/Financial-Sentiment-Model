@@ -54,6 +54,7 @@ class MultiScaleCNN(nn.Module):
         out = torch.cat([b1, b3, b5], dim=1)  # (B, 3*out_channels, T)
         # Global pooling over time dim (T=5) ➜ (B, C)
         out = F.adaptive_avg_pool1d(out, 1).squeeze(-1)
+        out = F.dropout(out, p=0.3, training=self.training)  # Added dropout for regularisation
         return out  # (B, C)
 
 
@@ -127,12 +128,13 @@ class TimesNetEncoder(nn.Module):
 # Gated Residual Fusion + Classifier
 # ---------------------------------------------------------------------------
 class TimesNetHybrid(nn.Module):
-    def __init__(self, features_per_day: int = 62, num_classes: int = 5):
+    def __init__(self, features_per_day: int = 62, num_classes: int = 5,
+                 cnn_channels: int = 256, timesnet_emb: int = 384, timesnet_depth: int = 4):
         super().__init__()
-        self.cnn = MultiScaleCNN(features_per_day, out_channels=96)  # ➜ 288-d
-        self.timesnet = TimesNetEncoder(in_features=features_per_day, emb_dim=192, depth=3)  # 192-d
-        fused_dim = 288  # cnn
-        times_dim = 192
+        self.cnn = MultiScaleCNN(features_per_day, out_channels=cnn_channels)  # ➜ 3*cnn_channels-d
+        self.timesnet = TimesNetEncoder(in_features=features_per_day, emb_dim=timesnet_emb, depth=timesnet_depth)
+        fused_dim = cnn_channels * 3  # from MultiScaleCNN concat
+        times_dim = timesnet_emb
         self.gate = nn.Sequential(
             nn.Linear(fused_dim + times_dim, fused_dim, bias=True),
             nn.Sigmoid()
@@ -161,9 +163,11 @@ class TimesNetHybrid(nn.Module):
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_timesnet_hybrid(features_per_day: int = 62, num_classes: int = 5):
-    """Factory so trainers can import a single function."""
-    return TimesNetHybrid(features_per_day=features_per_day, num_classes=num_classes)
+def create_timesnet_hybrid(features_per_day: int = 62, num_classes: int = 5,
+                            cnn_channels: int = 256, timesnet_emb: int = 384, timesnet_depth: int = 4):
+    """Factory that allows passing bigger model hyperparameters."""
+    return TimesNetHybrid(features_per_day=features_per_day, num_classes=num_classes,
+                          cnn_channels=cnn_channels, timesnet_emb=timesnet_emb, timesnet_depth=timesnet_depth)
 
 
 if __name__ == "__main__":
