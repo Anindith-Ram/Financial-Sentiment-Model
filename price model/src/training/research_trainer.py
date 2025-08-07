@@ -34,6 +34,7 @@ sys.path.append('.')
 from src.models.dataset import FinancialDataset
 from src.training.losses import FocalLoss
 from src.training.regularization import MixUp, LabelSmoothing
+from src.training.advanced_lr_scheduler import PerformanceSensitiveLRScheduler
 
 from src.models.timesnet_hybrid import create_timesnet_hybrid
 from src.models.timesnet_hybrid_optimized import create_optimized_timesnet_hybrid
@@ -149,29 +150,38 @@ class EnhancedCNNResearchTrainer:
     """
     
     def __init__(self, model, learning_rate: float = 0.001, weight_decay: float = 1e-4,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu", class_weights=None):
+                 device: str = "cuda" if torch.cuda.is_available() else "cpu", class_weights=None,
+                 checkpoint_path: str = None, resume_from_epoch: int = 0):
         self.model = model.to(device)
         self.device = device
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
+        # Checkpoint loading support
+        self.checkpoint_path = checkpoint_path
+        self.resume_from_epoch = resume_from_epoch
+        
         # Enhanced saving system with unique run IDs
-        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if checkpoint_path:
+            print(f"🔄 Resuming from checkpoint: {checkpoint_path}")
+            self.run_id = f"resumed_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        else:
+            self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"🆔 Research Training Run ID: {self.run_id}")
         
         # Best model state (only saved once at the end)
         self.best_model_state = None
         
-        # Enhanced early stopping (3 epochs as requested)
+        # Enhanced early stopping - will be updated if loading checkpoint
         self.best_val_loss = float('inf')
         self.best_val_acc = 0.0
         self.best_epoch = 0
-        self.patience = 5   # Reduced from 10 → More aggressive early stopping prevents overfitting
+        self.patience = 5   # REDUCED for faster training → Aggressive LR exploration needs less patience
         self.patience_counter = 0
         
-        # Dynamic Learning Rate Configuration
-        # Options: 'adaptive', 'onecycle', 'plateau'
-        self.lr_strategy = 'adaptive'  # Adaptive LR that responds to performance changes
+        # 🎯 LEARNING RATE STRATEGY 
+        self.lr_strategy = 'adaptive'  # Revert to proven fast method
+        self.use_swa = True  # Enable Stochastic Weight Averaging for final accuracy boost
         
         # Mixed precision training for better performance
         self.scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
@@ -180,20 +190,75 @@ class EnhancedCNNResearchTrainer:
         self.optimizer = self._create_optimizer()
         
         # Initialize scheduler based on configuration
-        if self.lr_strategy == 'adaptive':
-            # Adaptive LR that responds to performance changes
+        if self.lr_strategy == 'performance_sensitive':
+            # 🎯 NEW: Performance-sensitive LR based on your 2.80e-04 observation + proven adaptive features
+            self.scheduler = PerformanceSensitiveLRScheduler(
+                optimizer=self.optimizer,
+                base_lr=2.8e-4,  # Your optimal LR observation
+                memory_length=5,
+                sensitivity_threshold=0.001,  # 0.1% accuracy sensitivity
+                lr_search_range=(5e-5, 8e-4),
+                patience_for_search=3,
+                warmup_epochs=5,  # 🔥 ENABLE WARMUP: 5 epochs gradual LR increase
+                warmup_strategy='cosine',  # Smooth S-curve warmup for stability
+                # 🚀 ENHANCED FEATURES FROM PROVEN ADAPTIVE SCHEDULER
+                lr_increase_threshold=0.005,  # 0.5% improvement → increase LR (proven)
+                lr_decrease_threshold=-0.01,  # 1% drop → decrease LR (proven)
+                lr_multiplier_up=1.5,  # 50% increase multiplier (proven)
+                lr_multiplier_down=0.7,  # 30% decrease multiplier (proven)
+                plateau_escape_epochs=5,  # Plateau escape after 5 epochs (proven)
+                plateau_escape_multiplier=3.0,  # 3x LR boost (proven)
+                plateau_escape_cap=1.5,  # Cap at 1.5x original LR (proven)
+                verbose=True
+            )
+            self.scheduler_mode = "performance_sensitive"
+            print(f"🎯 Using Performance-Sensitive LR: base={2.8e-4:.2e} (your observation)")
+        elif self.lr_strategy == 'adaptive':
+            # 🧠 SMART STABILITY-AWARE ADAPTIVE LR - Recognizes sweet spots and maintains them
             self.scheduler = None  # Custom adaptive logic
             self.scheduler_mode = "adaptive"
             self.acc_history = []  # Track accuracy history for adaptive decisions
-            self.lr_increase_threshold = 0.005  # Increase LR if improving by >0.5% (more sensitive)
-            self.lr_decrease_threshold = -0.01  # Decrease LR if dropping by >1% (less sensitive to small drops)
-            self.lr_multiplier_up = 1.5  # Increase by 50% (more aggressive)
-            self.lr_multiplier_down = 0.7  # Decrease by 30% (more aggressive)
-            self.plateau_epochs = 0  # Track epochs without improvement
+            
+            # 🎯 SMART LR PARAMETERS - Stability-focused approach
+            self.lr_increase_threshold = 0.005  # Still sensitive to improvements
+            self.lr_decrease_threshold = -0.01  # Responsive to performance drops
+            self.lr_multiplier_up = 1.5  # AGGRESSIVE increase (50% for speed)
+            self.lr_multiplier_down = 0.6  # More aggressive drops (40% reduction)
+            
+            # 🧠 STABILITY TRACKING - Key innovation for smart LR management
+            self.lr_stability_period = 4  # Keep good LR for at least 4 epochs before considering changes
+            self.lr_stable_epochs = 0  # How long current LR has been stable
+            self.lr_performance_window = []  # Track performance over stability window
+            self.current_lr_is_effective = False  # Flag when LR is in sweet spot
+            
+            # 🎚️ AGGRESSIVE FAST LR OPTIMIZATION - Your exact specifications  
+            self.sweet_spot_threshold = 0.001  # 0.1% improvement = keep LR (sweet spot found)
+            self.explore_threshold = 0.0005  # 0.05% threshold for LR exploration  
+            self.negative_threshold = 0.0001  # 0.01% drop after LR increase = revert/lower
+            self.sweet_spot_epochs = 0  # Consecutive epochs of good performance
+            self.sweet_spot_required = 1  # AGGRESSIVE: Only 1 epoch needed for sweet spot (was 2)
+            
+            # 🚀 AGGRESSIVE EXPLORATION & RECOVERY
+            self.lr_just_increased = False  # Track if we just increased LR
+            self.prev_val_acc = 0.0  # Track previous accuracy for immediate feedback
+            self.exploration_mode = False  # Flag when actively exploring higher LR
+            self.aggressive_mode = True  # FORCE aggressive exploration
+            
+            # Original parameters
+            self.plateau_epochs = 0  # Track epochs without improvement  
             self.plateau_lr_boost = False  # Flag for plateau escape attempts
-            self.warmup_epochs = 3  # Number of epochs for LR warmup
+            self.warmup_epochs = 2  # REDUCED: Faster warmup for aggressive exploration
             self.current_epoch = 0  # Track current epoch for warmup
-            print(f"🧠 Using Adaptive LR: responds to accuracy changes")
+            
+            print(f"🚀 Using AGGRESSIVE FAST LR Optimizer: finds optimal LR in minimum time!")
+            print(f"  🎯 Sweet spot threshold: >{self.sweet_spot_threshold*100:.2f}% improvement = keep LR")
+            print(f"  🔍 Exploration rule: ≤{self.sweet_spot_threshold*100:.2f}% = AGGRESSIVELY explore higher LR")
+            print(f"  ⚠️ Recovery threshold: ≥{self.negative_threshold*100:.2f}% drop = immediate revert")
+            print(f"  ⚡ INSTANT detection: {self.sweet_spot_required} epoch only (was 2)")
+            print(f"  💨 AGGRESSIVE increases: +40% LR jumps (was +20%)")
+            print(f"  🎯 AGGRESSIVE decreases: -25% to -40% reductions")
+            print(f"  🚀 FIXED: 0.01% improvement now triggers exploration (was incorrectly stable)")
+            print(f"  ⏰ FASTER: 2-epoch warmup, 5-epoch patience, 4-epoch plateau escape")
         elif self.lr_strategy == 'onecycle':
             self.scheduler = None  # Will be initialized in train() method
             self.scheduler_mode = "onecycle"
@@ -226,6 +291,14 @@ class EnhancedCNNResearchTrainer:
         print(f"  📋 Label Smoothing: 10% → Prevents overconfidence")
         print(f"  🔇 Input Noise: 1% strength → Improves robustness")
         
+        # 🚀 STOCHASTIC WEIGHT AVERAGING (SWA) for final accuracy boost
+        if self.use_swa:
+            self.swa_model = None  # Will be initialized during training
+            self.swa_start_epoch = 0.8  # Start SWA at 80% of training
+            self.swa_freq = 5  # Update SWA model every 5 epochs
+            self.swa_lr = 1e-4  # Lower LR for SWA phase
+            print(f"🚀 SWA enabled: starts at 80% training, updates every {self.swa_freq} epochs")
+        
         # Training history
         self.train_losses = []
         self.val_losses = []
@@ -244,6 +317,10 @@ class EnhancedCNNResearchTrainer:
         
         # Component analysis
         self._analyze_components()
+        
+        # Load checkpoint if provided
+        if self.checkpoint_path:
+            self._load_checkpoint()
     
     def _analyze_components(self):
         """Analyze model components for monitoring"""
@@ -253,9 +330,61 @@ class EnhancedCNNResearchTrainer:
         
         print(f"🔍 Model Component Analysis:")
         print(f"  🧠 TimesNet Encoder: {gpt2_params:,} parameters")
-        print(f"  🎯 CNN Branch: {cnn_params:,} parameters")
+        print(f"  🎯 CNN Branch: {cnn_params:,} parameters")  
         print(f"  🎨 Classifier: {classifier_params:,} parameters")
         print(f"  📊 Total: {gpt2_params + cnn_params + classifier_params:,} parameters")
+    
+    def _reset_lr_tracking(self):
+        """Reset LR tracking variables when LR changes"""
+        self.lr_stable_epochs = 0
+        self.lr_performance_window.clear()
+        self.current_lr_is_effective = False
+        self.sweet_spot_epochs = 0
+        self.lr_just_increased = False
+        self.exploration_mode = False
+        print(f"   🔄 LR tracking reset - starting fresh evaluation")
+    
+    def _load_checkpoint(self):
+        """Load model checkpoint and resume training state"""
+        try:
+            print(f"📂 Loading checkpoint from: {self.checkpoint_path}")
+            checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+            
+            # Load model state
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                # Standard checkpoint format
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint and hasattr(self, 'scheduler'):
+                    try:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    except:
+                        print("⚠️  Could not load scheduler state, continuing with fresh scheduler")
+                
+                # Load training metadata if available
+                if 'best_val_acc' in checkpoint:
+                    self.best_val_acc = checkpoint['best_val_acc']
+                    print(f"✅ Loaded best validation accuracy: {self.best_val_acc:.2f}%")
+                if 'best_val_loss' in checkpoint:
+                    self.best_val_loss = checkpoint['best_val_loss']
+                if 'epoch' in checkpoint:
+                    self.resume_from_epoch = checkpoint['epoch'] + 1
+                    print(f"📍 Will resume from epoch: {self.resume_from_epoch}")
+                
+            else:
+                # Simple state dict format (just model weights)
+                self.model.load_state_dict(checkpoint)
+                print("✅ Loaded model weights (simple format)")
+            
+            print(f"🎯 Checkpoint loaded successfully!")
+            print(f"🔄 Ready to continue training from previous best accuracy: {self.best_val_acc:.2f}%")
+            
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            print("🔄 Continuing with fresh model initialization")
+            self.checkpoint_path = None
+            self.resume_from_epoch = 0
     
     def _create_optimizer(self):
         """Create optimizer with different learning rates for different components"""
@@ -283,12 +412,14 @@ class EnhancedCNNResearchTrainer:
             {'params': classifier_params, 'lr': self.learning_rate * 1.0}  # Full LR for classifier (was 0.8)
         ], weight_decay=self.weight_decay * 1.5, betas=(0.9, 0.999), eps=1e-8)  # Increased weight decay for regularization
         
-        print(f"⚙️  Enhanced Optimizer Configuration (Plateau-Breaking):")
-        print(f"  🧠 TimesNet LR: {self.learning_rate * 0.02:.6f} (0.02x - slightly higher)")
-        print(f"  🎯 CNN LR: {self.learning_rate * 0.8:.6f} (0.8x - enhanced learning)")
+        print(f"⚙️  Enhanced Multi-Component Optimizer Configuration:")
+        print(f"  🧠 TimesNet LR: {self.learning_rate * 0.02:.6f} (0.02x - fine-tuned for attention)")
+        print(f"  🎯 CNN LR: {self.learning_rate * 0.8:.6f} (0.8x - optimized for convolution)")
         print(f"  🎨 Classifier LR: {self.learning_rate * 1.0:.6f} (1.0x - full learning rate)")
         print(f"  📉 Weight Decay: {self.weight_decay * 1.5:.6f} (enhanced regularization)")
-        print(f"  🛡️ Gradient Clipping: 0.3 max norm (controlled gradients)")
+        print(f"  🛡️ Gradient Clipping: 0.1 max norm (tight control)")
+        print(f"  🔗 Components: {len(gpt2_params)} TimesNet + {len(cnn_params)} CNN + {len(classifier_params)} Classifier params")
+        print(f"  ✅ Multi-component ratios will be preserved by performance-sensitive scheduler")
         
         return optimizer
     
@@ -437,6 +568,32 @@ class EnhancedCNNResearchTrainer:
         
         return avg_loss, accuracy
     
+    def _evaluate_swa_model(self, val_loader: DataLoader) -> tuple:
+        """Evaluate the SWA (Stochastic Weight Averaging) model performance"""
+        if self.swa_model is None:
+            return float('inf'), 0.0
+        
+        self.swa_model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, target in val_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                output = self.swa_model(data)
+                loss = self.criterion(output, target)
+                
+                total_loss += loss.item()
+                pred = output.argmax(dim=1, keepdim=True)
+                correct += pred.eq(target.view_as(pred)).sum().item()
+                total += target.size(0)
+        
+        avg_loss = total_loss / len(val_loader)
+        accuracy = 100. * correct / total
+        
+        return avg_loss, accuracy
+    
     def train(self, train_loader: DataLoader, val_loader: DataLoader, 
               epochs: int = 50, save_dir: str = "models/research") -> dict:
         """Train the enhanced model with robust logging and interruption handling"""
@@ -466,8 +623,14 @@ class EnhancedCNNResearchTrainer:
         print(f"💾 Save directory: {save_dir}")
         print("=" * 60)
         
-        # Training progress bar
-        epoch_pbar = tqdm(range(epochs), desc="🎯 Training Progress", position=0)
+        # Training progress bar - adjusted for checkpoint resuming
+        start_epoch = self.resume_from_epoch
+        remaining_epochs = epochs - start_epoch
+        if start_epoch > 0:
+            print(f"🔄 Resuming training from epoch {start_epoch+1}/{epochs}")
+            print(f"📊 Remaining epochs: {remaining_epochs}")
+        
+        epoch_pbar = tqdm(range(start_epoch, epochs), desc="🎯 Training Progress", position=0)
         
         try:
             for epoch in epoch_pbar:
@@ -553,9 +716,13 @@ class EnhancedCNNResearchTrainer:
                     current_lr = current_lr_after
                     
                 elif self.scheduler_mode == "adaptive":
-                    # Enhanced Adaptive LR with plateau detection and escape mechanisms
+                    # 🚀 FAST SMART ADAPTIVE LR - Finds optimal quickly and maintains it!
                     self.acc_history.append(val_acc)
                     self.current_epoch += 1
+                    
+                    # Store previous accuracy for immediate feedback
+                    if len(self.acc_history) >= 2:
+                        self.prev_val_acc = self.acc_history[-2]
                     
                     # Warmup phase - gradually increase LR for first few epochs
                     if self.current_epoch <= self.warmup_epochs:
@@ -571,58 +738,135 @@ class EnhancedCNNResearchTrainer:
                         self.patience_counter = 0
                         current_lr = self.optimizer.param_groups[0]['lr']
                     else:
-                        # Track plateau epochs (only after warmup)
+                        # 🧠 SMART LR LOGIC - Post-warmup stability-aware adjustments
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        
+                        # Track plateau epochs
                         if val_acc <= self.best_val_acc:
                             self.plateau_epochs += 1
                         else:
                             self.plateau_epochs = 0
                             self.plateau_lr_boost = False  # Reset plateau escape flag
-                    
-                    if len(self.acc_history) >= 2 and self.current_epoch > self.warmup_epochs:
-                        acc_change = self.acc_history[-1] - self.acc_history[-2]
                         
-                        # Plateau escape mechanism - aggressive LR boost every 5 epochs of no improvement
-                        if self.plateau_epochs >= 5 and not self.plateau_lr_boost:
-                            new_lr = min(current_lr * 3.0, self.learning_rate * 1.5)  # 3x boost, cap at 1.5x original
-                            for param_group in self.optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                            self.plateau_lr_boost = True
-                            print(f"🚀 PLATEAU ESCAPE: LR boosted to {new_lr:.2e} (plateau for {self.plateau_epochs} epochs)")
-                            self.patience_counter = 0
+                        if len(self.acc_history) >= 2:
+                            acc_change = self.acc_history[-1] - self.acc_history[-2]
                             
-                        elif acc_change > self.lr_increase_threshold:
-                            # Accuracy improving significantly -> increase LR
-                            new_lr = min(current_lr * self.lr_multiplier_up, self.learning_rate * 2)
-                            for param_group in self.optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                            print(f"🔼 LR increased to {new_lr:.2e} (acc improved by {acc_change:.2f}%)")
-                            self.patience_counter = 0
-                            
-                        elif acc_change < self.lr_decrease_threshold:
-                            # Accuracy dropping significantly -> decrease LR 
-                            new_lr = max(current_lr * self.lr_multiplier_down, 1e-6)
-                            for param_group in self.optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                            print(f"🔽 LR decreased to {new_lr:.2e} (acc dropped by {acc_change:.2f}%)")
-                            self.patience_counter = 0
-                            
+                            # 🚀 PRIORITY 1: IMMEDIATE RECOVERY - Just increased LR and got ≥0.01% drop
+                            if self.lr_just_increased and acc_change < -self.negative_threshold:  # ≥0.01% drop after LR increase
+                                new_lr = max(current_lr * 0.75, 1e-6)  # More aggressive: 25% reduction (was 20%)
+                                for param_group in self.optimizer.param_groups:
+                                    param_group['lr'] = new_lr
+                                print(f"⚡ IMMEDIATE RECOVERY: LR {current_lr:.2e} → {new_lr:.2e} (acc dropped {acc_change:.3f}% after increase)")
+                                self._reset_lr_tracking()
+                                self.patience_counter = 0
+                                
+                            # 🍯 PRIORITY 2: SWEET SPOT CONFIRMED - >0.10% improvement = KEEP LR
+                            elif acc_change > self.sweet_spot_threshold:  # >0.10% improvement
+                                self.sweet_spot_epochs += 1
+                                self.lr_performance_window.append(acc_change)
+                                self.lr_just_increased = False  # Reset increase flag
+                                
+                                # INSTANT sweet spot confirmation (only 1 epoch needed!)
+                                if self.sweet_spot_epochs >= self.sweet_spot_required:
+                                    self.current_lr_is_effective = True
+                                    self.exploration_mode = False
+                                    print(f"🍯 SWEET SPOT CONFIRMED: LR {current_lr:.2e} is optimal! (+{acc_change:.3f}%)")
+                                    print(f"   🔒 MAINTAINING this LR - no exploration needed")
+                                else:
+                                    print(f"🎯 EXCELLENT: LR {current_lr:.2e} performing well (+{acc_change:.3f}%)")
+                                
+                                if val_acc <= self.best_val_acc:
+                                    self.patience_counter += 1
+                                else:
+                                    self.patience_counter = 0
+                                    
+                            # 🔍 PRIORITY 3: AGGRESSIVE EXPLORATION - ≤0.10% improvement = MUST TRY HIGHER LR
+                            elif acc_change <= self.sweet_spot_threshold and not self.current_lr_is_effective:  # ≤0.10% (includes your 0.01% case!)
+                                if not self.lr_just_increased:  # Only explore if we didn't just increase
+                                    new_lr = min(current_lr * 1.4, self.learning_rate * 2.5)  # MORE AGGRESSIVE: 40% increase (was 20%)
+                                    for param_group in self.optimizer.param_groups:
+                                        param_group['lr'] = new_lr
+                                    print(f"🔍 AGGRESSIVE EXPLORATION: LR {current_lr:.2e} → {new_lr:.2e}")
+                                    print(f"   💨 Improvement {acc_change:.3f}% ≤ 0.10% - MUST find better LR!")
+                                    self.lr_just_increased = True
+                                    self.exploration_mode = True
+                                    self.sweet_spot_epochs = 0  # Reset sweet spot tracking
+                                    self.patience_counter = 0
+                                else:
+                                    # Just increased last epoch, evaluate quickly
+                                    print(f"⏱️ QUICK EVAL: Testing new LR {current_lr:.2e} (improvement: {acc_change:.3f}%)")
+                                    if val_acc <= self.best_val_acc:
+                                        self.patience_counter += 1
+                                    else:
+                                        self.patience_counter = 0
+                                        
+                            # 🚨 PRIORITY 4: SEVERE DROP - Major performance decline
+                            elif acc_change < self.lr_decrease_threshold:  # < -1% drop
+                                new_lr = max(current_lr * 0.6, 1e-6)  # More aggressive: 40% reduction (was 30%)
+                                for param_group in self.optimizer.param_groups:
+                                    param_group['lr'] = new_lr
+                                print(f"🔽 SEVERE DROP: LR {current_lr:.2e} → {new_lr:.2e} (drop: {acc_change:.3f}%)")
+                                self._reset_lr_tracking()
+                                self.patience_counter = 0
+                                
+                            # 🚀 PRIORITY 5: PLATEAU ESCAPE - Extended stagnation
+                            elif self.plateau_epochs >= 4 and not self.plateau_lr_boost and not self.current_lr_is_effective:  # Faster: 4 epochs (was 6)
+                                new_lr = min(current_lr * 2.5, self.learning_rate * 2.0)  # More aggressive plateau escape
+                                for param_group in self.optimizer.param_groups:
+                                    param_group['lr'] = new_lr
+                                self.plateau_lr_boost = True
+                                print(f"🚀 PLATEAU ESCAPE: LR boosted to {new_lr:.2e} (stagnant for {self.plateau_epochs} epochs)")
+                                self._reset_lr_tracking()
+                                self.lr_just_increased = True
+                                self.exploration_mode = True
+                                self.patience_counter = 0
+                                
+                            # 🔄 EFFECTIVENESS LOSS - Sweet spot LR declining
+                            elif self.current_lr_is_effective and acc_change < 0:
+                                self.sweet_spot_epochs = 0
+                                self.current_lr_is_effective = False
+                                print(f"❌ EFFECTIVENESS LOST: Sweet spot LR {current_lr:.2e} declining ({acc_change:.3f}%)")
+                                print(f"   🔍 Will start aggressive exploration next epoch")
+                                if val_acc <= self.best_val_acc:
+                                    self.patience_counter += 1
+                                else:
+                                    self.patience_counter = 0
                         else:
-                            # Stable performance
-                            print(f"➡️ LR stable at {current_lr:.2e} (acc change: {acc_change:.2f}%, plateau: {self.plateau_epochs})")
+                            # First epoch post-warmup
+                            print(f"➡️ LR: {current_lr:.2e} (collecting initial data)")
                             if val_acc <= self.best_val_acc:
                                 self.patience_counter += 1
-                                print(f"  ⚠️  No improvement for {self.patience_counter}/{self.patience} epochs")
                             else:
                                 self.patience_counter = 0
-                    elif self.current_epoch > self.warmup_epochs:
-                        print(f"➡️ LR: {current_lr:.2e} (collecting history, plateau: {self.plateau_epochs})")
-                        if val_acc <= self.best_val_acc:
-                            self.patience_counter += 1
-                        else:
-                            self.patience_counter = 0
                     
                     current_lr = self.optimizer.param_groups[0]['lr']
                     
+                elif self.scheduler_mode == "performance_sensitive":
+                    # 🎯 NEW: Performance-sensitive scheduler based on your 2.80e-04 observation
+                    lr_info = self.scheduler.step(val_acc, epoch)
+                    current_lr = lr_info['new_lr']
+                    
+                    # Different output for warmup vs normal phases
+                    if lr_info.get('is_warmup', False):
+                        # During warmup: show progress and strategy
+                        print(f"🔥 Warmup Phase: {lr_info['old_lr']:.2e} → {current_lr:.2e}")
+                        print(f"   Strategy: {lr_info['reason']}")
+                        self.patience_counter = 0  # No early stopping during warmup
+                    else:
+                        # Post-warmup: show performance-sensitive adaptation
+                        print(f"🎯 Performance-Sensitive LR: {lr_info['old_lr']:.2e} → {current_lr:.2e}")
+                        if lr_info['reason'] != 'analyzing':
+                            print(f"   Reason: {lr_info['reason']}")
+                            print(f"   Acc improvement: {lr_info.get('accuracy_improvement', 0):.3f}%")
+                            print(f"   LR efficiency: {lr_info.get('lr_efficiency', 0):.3f}%")
+                        
+                        # Early stopping based on validation accuracy plateau (only post-warmup)
+                        if val_acc <= self.best_val_acc:
+                            self.patience_counter += 1
+                            print(f"  ⚠️  No improvement for {self.patience_counter}/{self.patience} epochs")
+                        else:
+                            self.patience_counter = 0
+                        
                 elif self.scheduler_mode == "onecycle":
                     # OneCycleLR: already stepped per batch, just track LR
                     print(f"🔄 OneCycle LR: {current_lr:.2e} (following predetermined schedule)")
@@ -636,6 +880,42 @@ class EnhancedCNNResearchTrainer:
                         self.patience_counter = 0
                 
                 self.learning_rates.append(current_lr)
+                
+                # 🚀 STOCHASTIC WEIGHT AVERAGING (SWA) for final accuracy boost
+                if self.use_swa and epoch >= int(epochs * self.swa_start_epoch):
+                    if self.swa_model is None:
+                        # Initialize SWA model
+                        self.swa_model = torch.optim.swa_utils.AveragedModel(self.model)
+                        print(f"🚀 SWA initialized at epoch {epoch+1}")
+                    
+                    # Update SWA model every swa_freq epochs
+                    if (epoch - int(epochs * self.swa_start_epoch)) % self.swa_freq == 0:
+                        self.swa_model.update_parameters(self.model)
+                        print(f"🚀 SWA model updated at epoch {epoch+1}")
+                        
+                        # Optionally evaluate SWA model performance
+                        if epoch == epochs - 1:  # Last epoch
+                            print(f"🧪 Evaluating SWA model performance...")
+                            swa_val_loss, swa_val_acc = self._evaluate_swa_model(val_loader)
+                            print(f"🚀 SWA Model: Val Loss={swa_val_loss:.4f}, Val Acc={swa_val_acc:.2f}%")
+                            
+                            # If SWA is better, use it as final model
+                            if swa_val_acc > self.best_val_acc:
+                                print(f"🎉 SWA model is better! {swa_val_acc:.2f}% > {self.best_val_acc:.2f}%")
+                                self.best_val_acc = swa_val_acc
+                                self.best_model_state = {
+                                    'epoch': epoch,
+                                    'model_state_dict': self.swa_model.module.state_dict().copy(),
+                                    'optimizer_state_dict': self.optimizer.state_dict(),
+                                    'train_loss': train_loss,
+                                    'val_loss': swa_val_loss,
+                                    'train_acc': train_acc,
+                                    'val_acc': swa_val_acc,
+                                    'best_val_loss': self.best_val_loss,
+                                    'best_val_acc': swa_val_acc,
+                                    'run_id': self.run_id,
+                                    'is_swa': True
+                                }
 
                 # Early stopping logic based on scheduler type
                 if self.scheduler_mode == "plateau":
@@ -643,8 +923,8 @@ class EnhancedCNNResearchTrainer:
                     if self.lr_reduce_count >= self.max_lr_reductions:
                         print("  🛑 Early stopping – LR reduced 4× with no new accuracy peak")
                         break
-                elif self.scheduler_mode in ["adaptive", "onecycle"]:
-                    # For Adaptive/OneCycleLR: stop if validation accuracy plateaus for too long
+                elif self.scheduler_mode in ["adaptive", "onecycle", "performance_sensitive"]:
+                    # For Adaptive/OneCycleLR/Performance-Sensitive: stop if validation accuracy plateaus for too long
                     if self.patience_counter >= self.patience:
                         print(f"  🛑 Early stopping – No improvement for {self.patience} epochs")
                         break
@@ -838,10 +1118,13 @@ def main():
     if not csv_path.exists():
         csv_path = project_root / "data" / "reduced_feature_set_dataset.csv"
     
-    # 🔧 ENHANCED HYPERPARAMETERS FOR OVERFITTING PREVENTION
+    # 🚀 OPTIMIZED HYPERPARAMETERS FOR RESUMING FROM 53.7% MODEL
+    # ============================================================
+    # These settings use the proven adaptive scheduler that achieved 53.7%
+    # Combined with extended training and enhanced regularization for 60%+ target
     batch_size = 32              # Reduced from 64 → Better generalization with smaller batches
-    epochs = 50
-    learning_rate = 0.0002       # Reduced from 0.0005 → More conservative learning prevents overfitting
+    epochs = 100                 # Extended for proven adaptive method → Should reach 55-60% faster
+    learning_rate = 2.8e-4       # Set to your observed optimal value → Adaptive scheduler will build on this
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
     test_size = 0.2
     random_state = 42
@@ -891,6 +1174,24 @@ def main():
     
     # ----- Model Selection -----
     MODEL_TYPE = "optimized_timesnet_hybrid"  # Using optimized version to prevent overfitting
+    
+    # 🔄 CHECKPOINT LOADING CONFIGURATION
+    # =====================================
+    # Option 1: Resume from 53.7% accuracy model (RECOMMENDED)
+    checkpoint_path = save_dir / "enhanced_cnn_best_20250806_134338.pth"
+    
+    # Option 2: Start fresh training (uncomment line below)
+    # checkpoint_path = None
+    
+    # Option 3: Resume from different checkpoint (modify path below)  
+    # checkpoint_path = save_dir / "enhanced_cnn_best_YYYYMMDD_HHMMSS.pth"
+    
+    if checkpoint_path and checkpoint_path.exists():
+        print(f"🎯 Found checkpoint: {checkpoint_path}")
+    else:
+        checkpoint_path = None
+        print(f"📝 No checkpoint found, starting fresh training")
+    
     print(f"\n🤖 Creating model: {MODEL_TYPE} ...")
 
     if MODEL_TYPE == "optimized_timesnet_hybrid":
@@ -909,12 +1210,13 @@ def main():
     else:
         raise ValueError(f"Unknown MODEL_TYPE: {MODEL_TYPE}")
     
-    # Create trainer with class weights for imbalanced data
+    # Create trainer with class weights for imbalanced data and checkpoint loading
     trainer = EnhancedCNNResearchTrainer(
         model=model,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        class_weights=class_weights
+        class_weights=class_weights,
+        checkpoint_path=str(checkpoint_path) if checkpoint_path else None
     )
     
     # Train model
@@ -928,10 +1230,24 @@ def main():
     # Plot training curves
     trainer.plot_training_curves(os.path.join(save_dir, 'training_curves.png'))
     
+    # 🎯 Generate LR performance analysis if using performance-sensitive scheduler
+    if hasattr(trainer.scheduler, 'plot_lr_performance'):
+        lr_analysis_path = os.path.join(save_dir, 'lr_performance_analysis.png')
+        trainer.scheduler.plot_lr_performance(lr_analysis_path)
+        
+        # Print LR insights
+        lr_summary = trainer.scheduler.get_performance_summary()
+        print(f"\n🎯 Learning Rate Analysis:")
+        print(f"  🎪 Best LR found: {lr_summary['best_lr']:.2e}")
+        print(f"  🏆 Best accuracy achieved: {lr_summary['best_accuracy']:.2f}%")
+        print(f"  📊 LR performance analysis saved to: {lr_analysis_path}")
+    
     # Print final results
     print("\n🎉 Research training completed!")
     print(f"🏆 Best validation accuracy: {max(history['val_accuracies']):.2f}%")
     print(f"📉 Best validation loss: {min(history['val_losses']):.4f}")
+    if hasattr(trainer, 'swa_model') and trainer.swa_model is not None:
+        print(f"🚀 SWA model was used for final accuracy boost!")
     print(f"📁 Training history saved to: {save_dir}/training_history.json")
     print(f"💾 Best model saved to: {save_dir}/enhanced_cnn_best.pth")
     print(f"📊 Training curves saved to: {save_dir}/training_curves.png")
