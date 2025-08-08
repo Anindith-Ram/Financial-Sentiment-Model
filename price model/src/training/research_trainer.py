@@ -301,12 +301,12 @@ class EnhancedCNNResearchTrainer:
         self.mixup = MixUp(alpha=0.2)
         self.cutmix = CutMix(alpha=0.2)
         # Softer early regularization; will ramp after warmup epochs
-        self.mixup_prob = 0.2
+        self.mixup_prob = 0.1
         self.cutmix_prob = 0.0
-        self.reg_ramp_epochs = 5
+        self.reg_ramp_epochs = 15
         
         # Label Smoothing - prevents model from being overconfident
-        self.label_smoothing = LabelSmoothing(smoothing=0.05)  # milder early smoothing
+        self.label_smoothing = LabelSmoothing(smoothing=0.02)  # very mild smoothing early
         
         # Enhanced loss function with class weights for severe imbalance
         if class_weights is not None:
@@ -324,7 +324,7 @@ class EnhancedCNNResearchTrainer:
         
         print(f"🛡️ Regularization enabled:")
         print(f"  📊 MixUp: α=0.2, prob={int(self.mixup_prob*100)}% → Early epochs softened")
-        print(f"  📋 Label Smoothing: 5% → Early stability")
+        print(f"  📋 Label Smoothing: 2% → Early stability (will ramp to 5% after {self.reg_ramp_epochs} epochs)")
         print(f"  🔇 Input Noise: 1% strength → Improves robustness")
         
         # 🚀 EMA weights instead of SWA
@@ -445,16 +445,16 @@ class EnhancedCNNResearchTrainer:
         
         # Enhanced optimizer with different LR strategies for plateau breaking
         optimizer = optim.AdamW([
-            {'params': gpt2_params, 'lr': self.learning_rate * 0.02},   # Slightly higher for TimesNet (was 0.01)
-            {'params': cnn_params, 'lr': self.learning_rate * 0.8},     # Higher CNN LR for better learning (was 0.5)
-            {'params': classifier_params, 'lr': self.learning_rate * 1.0}  # Full LR for classifier (was 0.8)
-        ], weight_decay=self.weight_decay * 1.5, betas=(0.9, 0.999), eps=1e-8)  # Increased weight decay for regularization
+            {'params': gpt2_params, 'lr': self.learning_rate * 0.05},   # TimesNet 0.05x base
+            {'params': cnn_params, 'lr': self.learning_rate * 1.0},     # CNN 1.0x
+            {'params': classifier_params, 'lr': self.learning_rate * 1.0}  # Head 1.0x
+        ], weight_decay=2e-4, betas=(0.9, 0.999), eps=1e-8)
         
         print(f"⚙️  Enhanced Multi-Component Optimizer Configuration:")
-        print(f"  🧠 TimesNet LR: {self.learning_rate * 0.02:.6f} (0.02x - fine-tuned for attention)")
-        print(f"  🎯 CNN LR: {self.learning_rate * 0.8:.6f} (0.8x - optimized for convolution)")
-        print(f"  🎨 Classifier LR: {self.learning_rate * 1.0:.6f} (1.0x - full learning rate)")
-        print(f"  📉 Weight Decay: {self.weight_decay * 1.5:.6f} (enhanced regularization)")
+        print(f"  🧠 TimesNet LR: {self.learning_rate * 0.05:.6f} (0.05x)")
+        print(f"  🎯 CNN LR: {self.learning_rate * 1.0:.6f} (1.0x)")
+        print(f"  🎨 Classifier LR: {self.learning_rate * 1.0:.6f} (1.0x)")
+        print(f"  📉 Weight Decay: {2e-4:.6f}")
         print(f"  🛡️ Gradient Clipping: 0.1 max norm (tight control)")
         print(f"  🔗 Components: {len(gpt2_params)} TimesNet + {len(cnn_params)} CNN + {len(classifier_params)} Classifier params")
         print(f"  ✅ Multi-component learning rates configured and preserved across steps")
@@ -474,8 +474,9 @@ class EnhancedCNNResearchTrainer:
         total = 0
         # After ramp, enable stronger regularization
         if epoch >= self.reg_ramp_epochs:
-            self.mixup_prob = 0.4
+            self.mixup_prob = 0.2
             self.cutmix_prob = 0.2
+            self.label_smoothing = LabelSmoothing(smoothing=0.05)
         
         # Progress bar for batches
         pbar = tqdm(train_loader, desc="🔄 Training", leave=False)
@@ -805,17 +806,18 @@ class EnhancedCNNResearchTrainer:
             steps_per_epoch = len(train_loader)
             total_steps = epochs * steps_per_epoch
             # Use per-param-group max_lr to preserve ratios and keep schedule conservative (1.5x)
-            max_lrs = [pg['lr'] * 1.5 for pg in self.optimizer.param_groups]
+            max_lrs = [pg['lr'] * 2.0 for pg in self.optimizer.param_groups]
             self.scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=max_lrs,
                 total_steps=total_steps,
-                pct_start=0.5,  # slower warmup to avoid early blow-ups
+                pct_start=0.15,  # faster warmup to reach useful LR
                 cycle_momentum=False,
                 anneal_strategy='cos'
             )
+            # Report the largest LR (typically classifier/CNN) for clarity
             pretty_max = ", ".join(f"{lr:.2e}" for lr in max_lrs)
-            print(f"🔄 OneCycleLR initialized: {total_steps} total steps, max_lr per group=[{pretty_max}]")
+            print(f"🔄 OneCycleLR initialized: {total_steps} total steps, max_lr per group=[{pretty_max}] (plot shows max group)")
         
         print(f"🚀 Starting research training for {epochs} epochs...")
         print(f"📊 Training samples: {len(train_loader.dataset):,}")
@@ -1251,9 +1253,10 @@ class EnhancedCNNResearchTrainer:
             ax1.set_ylabel('Validation Accuracy (%)', color='#F18F01', fontweight='bold')
             ax1.tick_params(axis='y', labelcolor='#F18F01')
             
-            # Learning rate on right axis (if available)
+            # Learning rate on right axis (if available) – plot the max LR across param groups per epoch for clarity
             if self.learning_rates:
-                line2 = ax2.plot(epochs, self.learning_rates[:len(epochs)], label='Learning Rate', 
+                lrs = self.learning_rates[:len(epochs)] if isinstance(self.learning_rates[0], (int, float)) else [max(l) if isinstance(l, (list, tuple)) else l for l in self.learning_rates[:len(epochs)]]
+                line2 = ax2.plot(epochs, lrs, label='Learning Rate (max group)', 
                                color='#C73E1D', linewidth=2, linestyle='--')
                 ax2.set_ylabel('Learning Rate', color='#C73E1D', fontweight='bold')
                 ax2.tick_params(axis='y', labelcolor='#C73E1D')
@@ -1352,7 +1355,7 @@ def main():
     # These settings use the proven adaptive scheduler that achieved 53.7%
     # Combined with extended training and enhanced regularization for 60%+ target
     batch_size = 256              # Larger effective batch for stability; use AMP and gradient clipping
-    epochs = 150                 # Extended for proven adaptive method → Should reach 55-60% faster
+    epochs = 100                 # Extended for proven adaptive method → Should reach 55-60% faster
     learning_rate = 2.8e-4       # Restored proven base LR to avoid instability with OneCycle
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
     test_size = 0.2
