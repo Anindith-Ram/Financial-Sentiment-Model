@@ -199,7 +199,7 @@ class EnhancedCNNResearchTrainer:
         self.best_val_loss = float('inf')
         self.best_val_acc = 0.0
         self.best_epoch = 0
-        self.patience = 5   # REDUCED for faster training → Aggressive LR exploration needs less patience
+        self.patience = 10   # Keep at 10
         self.patience_counter = 0
         
         # 🎯 LEARNING RATE STRATEGY 
@@ -339,6 +339,9 @@ class EnhancedCNNResearchTrainer:
         self.val_losses = []
         self.train_accuracies = []
         self.val_accuracies = []
+        self.val_macro_f1s = []
+        self.val_aurocs = []
+        self.val_precision_at_k = []
         self.learning_rates = []
         
         # Training metadata for comprehensive logging
@@ -712,6 +715,10 @@ class EnhancedCNNResearchTrainer:
                 precision_at_k = (y_true_prob[topk_idx] == 2).mean() if k > 0 else 0.0
             coverage = coverage_counter / len(y_true_prob) if prob_targets else 0.0
             selective_precision = (positive_correct / coverage_counter) if coverage_counter > 0 else 0.0
+            # Save to history arrays
+            self.val_macro_f1s.append(float(macro_f1))
+            self.val_aurocs.append(float(auroc))
+            self.val_precision_at_k.append(float(precision_at_k))
             print(f"  🎯 Macro-F1: {macro_f1:.3f} | AUROC(OVR): {auroc:.3f} | Precision@1%: {precision_at_k:.3f} | Selective P(up|p>{self.select_threshold}): {selective_precision:.3f} @Coverage {coverage:.2%}")
         except Exception as e:
             print(f"⚠️  Metric computation issue: {e}")
@@ -835,7 +842,7 @@ class EnhancedCNNResearchTrainer:
                 # Validation
                 val_loss, val_acc = self.validate(val_loader)
                 
-                # Store history
+                # Store history (metrics populated inside validate via prints; recompute concise ones here if needed)
                 self.train_losses.append(train_loss)
                 self.val_losses.append(val_loss)
                 self.train_accuracies.append(train_acc)
@@ -1155,6 +1162,9 @@ class EnhancedCNNResearchTrainer:
             'val_losses': self.val_losses,
             'train_accuracies': self.train_accuracies,
             'val_accuracies': self.val_accuracies,
+            'val_macro_f1s': getattr(self, 'val_macro_f1s', []),
+            'val_aurocs': getattr(self, 'val_aurocs', []),
+            'val_precision_at_k': getattr(self, 'val_precision_at_k', []),
             'learning_rates': self.learning_rates,
             'best_val_loss': self.best_val_loss,
             'best_val_acc': self.best_val_acc,
@@ -1222,6 +1232,8 @@ class EnhancedCNNResearchTrainer:
             plt.subplot(1, 3, 2)
             plt.plot(epochs, self.train_accuracies, label='Train Accuracy', color='#2E86AB', linewidth=2.5)
             plt.plot(epochs, self.val_accuracies, label='Val Accuracy', color='#A23B72', linewidth=2.5)
+            if getattr(self, 'val_macro_f1s', None):
+                plt.plot(epochs[:len(self.val_macro_f1s)], [m*100 for m in self.val_macro_f1s], label='Macro-F1 (%)', color='#27AE60', linestyle='--', linewidth=2)
             plt.title('📈 Training & Validation Accuracy', fontsize=14, fontweight='bold')
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy (%)')
@@ -1427,7 +1439,7 @@ def main():
     )
     
     # Optional: Purged Time-Series CV with embargo (opt-in)
-    use_cv = False  # set True to enable
+    use_cv = True  # set True to enable
     embargo_frac = 0.02
     n_splits = 5
 
