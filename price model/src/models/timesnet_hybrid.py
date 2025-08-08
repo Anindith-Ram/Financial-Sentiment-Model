@@ -139,15 +139,18 @@ class TimesNetHybrid(nn.Module):
             nn.Linear(fused_dim + times_dim, fused_dim, bias=True),
             nn.Sigmoid()
         )
-        self.classifier = nn.Sequential(
+        # Shared trunk
+        self.trunk = nn.Sequential(
             nn.Linear(fused_dim, 1024),
             nn.ReLU(),
             nn.Dropout(0.4),
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_classes)
+            nn.Dropout(0.3)
         )
+        # Heads
+        self.head_class = nn.Linear(512, num_classes)
+        self.head_reg = nn.Linear(512, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x : (B, 5, 62)
@@ -155,8 +158,10 @@ class TimesNetHybrid(nn.Module):
         t_feat = self.timesnet(x)       # (B, 192)
         gate = self.gate(torch.cat([cnn_feat, t_feat], dim=1))  # (B, 288)
         fused = cnn_feat + gate * cnn_feat + (1 - gate) * t_feat.mean(dim=1, keepdim=False).unsqueeze(1).repeat(1, cnn_feat.size(1))
-        out = self.classifier(fused)
-        return out
+        h = self.trunk(fused)
+        logits = self.head_class(h)
+        ret_pred = self.head_reg(h).squeeze(-1)
+        return logits, ret_pred
 
 
 # ---------------------------------------------------------------------------

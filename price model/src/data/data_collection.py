@@ -83,7 +83,14 @@ class ProfessionalDataCollector:
             "start_date": "2020-01-01",
             "end_date": datetime.now().strftime("%Y-%m-%d"),
             "sequence_length": 5,
-            "tickers": self._get_default_tickers()
+            "tickers": self._get_default_tickers(),
+            # Labeling configuration
+            # label_mode: 'rolling_quantiles' (original) or 'absolute_bands'
+            "label_mode": "rolling_quantiles",
+            # For absolute_bands: define neutral band and up/down thresholds (daily returns)
+            # Example: neutral if |ret| <= 0.0015 (0.15%), up if ret >= 0.003 (0.30%), down if ret <= -0.003
+            "neutral_band": 0.0015,
+            "up_down_threshold": 0.003
         }
         
         logger.info(f"🏗️ Data Collector initialized")
@@ -294,7 +301,12 @@ class ProfessionalDataCollector:
         return data
     
     def create_sequences(self, df: pd.DataFrame, sequence_length: int = 5) -> pd.DataFrame:
-        """Create sequences and 3-class labels (rolling 33/66%) per ticker."""
+        """Create sequences and 3-class labels per ticker.
+
+        Supports two labeling modes:
+        - 'rolling_quantiles' (default): next-day return vs rolling 33/66% quantiles
+        - 'absolute_bands': fixed return bands using config neutral_band and up_down_threshold
+        """
         
         if len(df) < sequence_length + 1:
             logger.warning(f"⚠️ Insufficient data for sequences: {len(df)} < {sequence_length + 1}")
@@ -302,22 +314,47 @@ class ProfessionalDataCollector:
         
         sequences = []
         
-        # Compute next-day return and rolling thresholds (use past info only)
+        # Compute next-day return and helper series
         df = df.sort_values('Date').copy()
         df['ret1'] = df['Close'].pct_change().shift(-1)
         past_ret = df['ret1'].shift(1)
-        q33 = past_ret.rolling(252, min_periods=60).quantile(0.33)
-        q66 = past_ret.rolling(252, min_periods=60).quantile(0.66)
-        label3 = np.where(df['ret1'] < q33, 0, np.where(df['ret1'] > q66, 2, 1)).astype(int)
-        # Early region fallback
-        med = past_ret.rolling(60, min_periods=20).median()
-        mask = q33.isna() | q66.isna()
-        label3 = np.array(label3)
-        if mask.any():
-            label3[mask.values] = np.where(df.loc[mask, 'ret1'] < med[mask], 0, 2)
-        label3 = np.where(df['ret1'].isna(), 1, label3)
 
-        # Get feature columns (exclude metadata & the new helper columns)
+        label_mode = self.config.get('label_mode', 'rolling_quantiles')
+        if label_mode == 'absolute_bands':
+            neutral_band = float(self.config.get('neutral_band', 0.0015))
+            thr = float(self.config.get('up_down_threshold', 0.003))
+            r = df['ret1']
+            label3 = np.where(r <= -thr, 0, np.where(np.abs(r) <= neutral_band, 1, 2)).astype(int)
+            label3 = np.where(r.isna(), 1, label3)
+        else:
+            # Rolling 33/66% quantiles (original)
+            q33 = past_ret.rolling(252, min_periods=60).quantile(0.33)
+            q66 = past_ret.rolling(252, min_periods=60).quantile(0.66)
+            label3 = np.where(df['ret1'] < q33, 0, np.where(df['ret1'] > q66, 2, 1)).astype(int)
+            # Early region fallback
+            med = past_ret.rolling(60, min_periods=20).median()
+            mask = q33.isna() | q66.isna()
+            label3 = np.array(label3)
+            if mask.any():
+                label3[mask.values] = np.where(df.loc[mask, 'ret1'] < med[mask], 0, 2)
+            label3 = np.where(df['ret1'].isna(), 1, label3)
+
+        # Add richer features (momentum, volatility, gaps, simple regime flags)
+        df['ret1_abs'] = df['ret1'].abs()
+        df['mom_5'] = df['Close'].pct_change(5)
+        df['mom_10'] = df['Close'].pct_change(10)
+        df['mom_20'] = df['Close'].pct_change(20)
+        df['vol_5'] = df['Close'].pct_change().rolling(5).std()
+        df['vol_10'] = df['Close'].pct_change().rolling(10).std()
+        df['vol_20'] = df['Close'].pct_change().rolling(20).std()
+        df['turnover'] = (df['Volume'] / (df['Volume'].rolling(20).mean().replace(0, np.nan))).fillna(0)
+        df['overnight_gap'] = (df['Open'] / df['Close'].shift(1) - 1)
+        # Simple regime flags
+        vol20 = df['vol_20'].fillna(method='ffill')
+        df['regime_high_vol'] = (vol20 > vol20.rolling(60, min_periods=20).median()).astype(int)
+        df['regime_trending'] = (df['mom_20'].abs() > df['mom_20'].rolling(60, min_periods=20).median().abs()).astype(int)
+
+        # Get feature columns (exclude metadata & helper columns not needed at inference-time)
         feature_cols = [col for col in df.columns if col not in ['Date', 'Ticker', 'ret1']]
         
         for i in range(len(df) - sequence_length):
@@ -330,6 +367,8 @@ class ProfessionalDataCollector:
             # Create sequence record
             sequence_record = {f'feature_{j}': val for j, val in enumerate(sequence_data)}
             sequence_record['Label'] = label  # 0/1/2
+            # Provide continuous target for optional regression head
+            sequence_record['TargetRet'] = float(df.iloc[i+sequence_length]['ret1']) if not pd.isna(df.iloc[i+sequence_length]['ret1']) else 0.0
             sequence_record['Ticker'] = df.iloc[i+sequence_length]['Ticker']
             
             sequences.append(sequence_record)

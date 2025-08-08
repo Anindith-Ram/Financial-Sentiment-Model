@@ -124,12 +124,13 @@ class ProgressiveTrainer:
             
             # Forward pass
             output = self.model(data)
+            logits = output[0] if isinstance(output, (list, tuple)) else output
             
             # Enhanced loss calculation
             if TRAINING_CONFIG.get('MIXUP_AUGMENTATION', False) and mixup_alpha > 0:
-                loss = lam * self.criterion(output, target_a) + (1 - lam) * self.criterion(output, target_b)
+                loss = lam * self.criterion(logits, target_a) + (1 - lam) * self.criterion(logits, target_b)
             else:
-                loss = self.criterion(output, target)
+                loss = self.criterion(logits, target)
             
             # Backward pass with gradient clipping
             loss.backward()
@@ -142,7 +143,7 @@ class ProgressiveTrainer:
             self.optimizer.step()
             
             # Calculate accuracy
-            pred = output.argmax(dim=1, keepdim=True)
+            pred = logits.argmax(dim=1, keepdim=True)
             if TRAINING_CONFIG.get('MIXUP_AUGMENTATION', False) and mixup_alpha > 0:
                 # For mixup, use original target for accuracy
                 correct += pred.eq(target_a.view_as(pred)).sum().item()
@@ -190,10 +191,11 @@ class ProgressiveTrainer:
             for batch_idx, (data, target) in enumerate(pbar):
                 data, target = data.to(self.device), target.to(self.device)
                 output = self.model(data)
-                loss = self.criterion(output, target)
+                logits = output[0] if isinstance(output, (list, tuple)) else output
+                loss = self.criterion(logits, target)
                 
                 total_loss += loss.item()
-                pred = output.argmax(dim=1, keepdim=True)
+                pred = logits.argmax(dim=1, keepdim=True)
                 correct += pred.eq(target.view_as(pred)).sum().item()
                 total += target.size(0)
                 

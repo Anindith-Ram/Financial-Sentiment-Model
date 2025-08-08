@@ -15,7 +15,7 @@ class FinancialDataset(Dataset):
     Compatible with TimeGPT integration
     """
     
-    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 5):
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 5, y_cont: np.ndarray = None):
         """
         Initialize the dataset
         
@@ -27,6 +27,7 @@ class FinancialDataset(Dataset):
         self.X = X.astype(np.float32)
         self.y = y.astype(np.int64)
         self.seq_len = seq_len
+        self.y_cont = None if y_cont is None else y_cont.astype(np.float32)
         
         # Calculate features per day
         self.features_per_day = X.shape[1] // seq_len
@@ -60,9 +61,10 @@ class FinancialDataset(Dataset):
         # Reshape features from flat to (seq_len, features_per_day)
         features = self.X[idx].reshape(self.seq_len, self.features_per_day)
         features = torch.from_numpy(features).float()
-        
         label = torch.tensor(self.y[idx], dtype=torch.long)
-        
+        if self.y_cont is not None:
+            cont = torch.tensor(self.y_cont[idx], dtype=torch.float32)
+            return features, label, cont
         return features, label
     
     def normalize_features(self, X):

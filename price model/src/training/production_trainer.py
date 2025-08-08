@@ -145,7 +145,8 @@ class EnhancedCNNProductionTrainer:
             # Forward pass
             self.optimizer.zero_grad()
             output = self.model(data)
-            loss = self.criterion(output, target)
+            logits = output[0] if isinstance(output, (list, tuple)) else output
+            loss = self.criterion(logits, target)
             
             # Backward pass
             loss.backward()
@@ -160,7 +161,7 @@ class EnhancedCNNProductionTrainer:
             
             # Statistics
             total_loss += loss.item()
-            pred = output.argmax(dim=1, keepdim=True)
+            pred = logits.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += target.size(0)
             
@@ -191,10 +192,11 @@ class EnhancedCNNProductionTrainer:
             for data, target in pbar:
                 data, target = data.to(self.device), target.to(self.device)
                 output = self.model(data)
-                loss = self.criterion(output, target)
+                logits = output[0] if isinstance(output, (list, tuple)) else output
+                loss = self.criterion(logits, target)
                 
                 total_loss += loss.item()
-                pred = output.argmax(dim=1, keepdim=True)
+                pred = logits.argmax(dim=1, keepdim=True)
                 correct += pred.eq(target.view_as(pred)).sum().item()
                 total += target.size(0)
                 
@@ -424,14 +426,19 @@ def run_production_training(csv_path: str = "data/reduced_feature_set_dataset.cs
     MODEL_TYPE = "timesnet_hybrid"  # Change if needed
     print(f"🤖 Creating model: {MODEL_TYPE} ...")
 
-    # Calculate features per day from dataset
+    # Calculate features per day and num_classes from dataset
     df_temp = pd.read_csv(csv_path)
-    feature_cols_temp = [col for col in df_temp.columns if col not in ['Ticker', 'Label']]
+    label_col = 'Label' if 'Label' in df_temp.columns else ('Label_3' if 'Label_3' in df_temp.columns else None)
+    if label_col is None:
+        raise ValueError("Dataset must contain 'Label' or 'Label_3' column for supervised training")
+    feature_cols_temp = [col for col in df_temp.columns if col not in ['Ticker', label_col]]
     features_per_day = len(feature_cols_temp) // 5
+    num_classes = int(df_temp[label_col].nunique())
     print(f"📊 Auto-detected features per day: {features_per_day}")
+    print(f"🎯 Auto-detected num classes: {num_classes}")
 
     if MODEL_TYPE == "timesnet_hybrid":
-        model = create_timesnet_hybrid(features_per_day=features_per_day, num_classes=5)
+        model = create_timesnet_hybrid(features_per_day=features_per_day, num_classes=num_classes)
     elif MODEL_TYPE == "simple_cnn":
         from src.training.simple_cnn_trainer import SimpleCNN
         model = SimpleCNN(features_per_day=features_per_day, num_classes=5)
@@ -455,8 +462,11 @@ def run_production_training(csv_path: str = "data/reduced_feature_set_dataset.cs
     
     # Print final results
     print("\n🎉 Production training completed!")
-    print(f"🏆 Best validation accuracy: {max(history['val_accuracies']):.2f}%")
-    print(f"📉 Best validation loss: {min(history['val_losses']):.4f}")
+    if isinstance(history, dict) and history.get('val_accuracies') and history.get('val_losses'):
+        print(f"🏆 Best validation accuracy: {max(history['val_accuracies']):.2f}%")
+        print(f"📉 Best validation loss: {min(history['val_losses']):.4f}")
+    else:
+        print("⚠️  No validation metrics available (training ended before first epoch)")
     print(f"📁 Training history saved to: {save_dir}/training_history.json")
     print(f"💾 Best model saved to: {save_dir}/enhanced_cnn_best.pth")
     

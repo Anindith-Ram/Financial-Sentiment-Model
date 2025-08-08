@@ -16,6 +16,7 @@ from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import os
@@ -35,6 +36,7 @@ from src.models.dataset import FinancialDataset
 from src.training.losses import FocalLoss
 from src.training.regularization import MixUp, LabelSmoothing
 from src.training.advanced_lr_scheduler import PerformanceSensitiveLRScheduler
+from sklearn.metrics import f1_score, roc_auc_score
 
 from src.models.timesnet_hybrid import create_timesnet_hybrid
 from src.models.timesnet_hybrid_optimized import create_optimized_timesnet_hybrid
@@ -138,14 +140,21 @@ def load_and_preprocess_data(csv_path: str = "data/reduced_feature_set_dataset.c
     print(f"📈 Dataset shape (train/test): {X_train.shape} / {X_test.shape}")
     print(f"🔢 Features per sample: {X_train.shape[1]}")
 
-    # Class weights (3-class)
+    # Class weights (3-class) – ensure weight exists for all 3 classes
     uniq, cnts = np.unique(y_train, return_counts=True)
     total = len(y_train)
     raw_w = total / (len(uniq) * cnts)
-    class_weights = np.clip(raw_w, 0.5, 3.0)
-    print("\n⚖️ Moderated class weights:")
-    for c, rw, mw in zip(uniq, raw_w, class_weights):
-        print(f"  Class {c}: {rw:.3f} → {mw:.3f}")
+    # Start with neutral weights
+    weights_full = np.ones(3, dtype=np.float32)
+    # Assign computed weights to present classes
+    for cls_id, w in zip(uniq.astype(int), raw_w):
+        weights_full[cls_id] = np.clip(w, 0.5, 3.0)
+    class_weights = weights_full
+    print("\n⚖️ Moderated class weights (3-class):")
+    for cls_id in range(3):
+        # Show underlying raw if available
+        rw = raw_w[list(uniq).index(cls_id)] if cls_id in uniq else 1.0
+        print(f"  Class {cls_id}: {rw:.3f} → {class_weights[cls_id]:.3f}")
 
     # Sequence info
     seq_len = 5
@@ -195,7 +204,8 @@ class EnhancedCNNResearchTrainer:
         
         # 🎯 LEARNING RATE STRATEGY 
         self.lr_strategy = 'onecycle'  # Regular OneCycleLR schedule (aggressive off)
-        self.use_swa = True  # Enable Stochastic Weight Averaging for final accuracy boost
+        # SWA is disabled; EMA is the chosen averaging method
+        self.use_swa = False
         
         # Mixed precision training for better performance
         self.scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
@@ -290,21 +300,31 @@ class EnhancedCNNResearchTrainer:
         # MixUp data augmentation - reduces overfitting by creating synthetic training examples
         self.mixup = MixUp(alpha=0.2)
         self.cutmix = CutMix(alpha=0.2)
-        self.mixup_prob = 0.4
-        self.cutmix_prob = 0.2
+        # Softer early regularization; will ramp after warmup epochs
+        self.mixup_prob = 0.2
+        self.cutmix_prob = 0.0
+        self.reg_ramp_epochs = 5
         
         # Label Smoothing - prevents model from being overconfident
-        self.label_smoothing = LabelSmoothing(smoothing=0.1)  # 10% smoothing
+        self.label_smoothing = LabelSmoothing(smoothing=0.05)  # milder early smoothing
         
         # Enhanced loss function with class weights for severe imbalance
         if class_weights is not None:
             class_weights = torch.FloatTensor(class_weights).to(device)
             print(f"🎯 Using class weights: {class_weights.cpu().numpy()}")
         self.criterion = FocalLoss(weight=class_weights, gamma=1.5)
+        # Regression loss for optional dual-head (ordinal/regression auxiliary)
+        self.use_regression_head = True
+        self.lambda_reg = 0.2
+        self.regression_loss = nn.SmoothL1Loss()
+        # Temperature scaling for calibration (learned after training on validation logits)
+        self.temperature = torch.nn.Parameter(torch.ones(1, device=self.device), requires_grad=True)
+        self.use_temperature_scaling = True
+        self.select_threshold = 0.6  # abstain below this probability
         
         print(f"🛡️ Regularization enabled:")
-        print(f"  📊 MixUp: α=0.2, prob=50% → Creates diverse training examples")
-        print(f"  📋 Label Smoothing: 10% → Prevents overconfidence")
+        print(f"  📊 MixUp: α=0.2, prob={int(self.mixup_prob*100)}% → Early epochs softened")
+        print(f"  📋 Label Smoothing: 5% → Early stability")
         print(f"  🔇 Input Noise: 1% strength → Improves robustness")
         
         # 🚀 EMA weights instead of SWA
@@ -434,7 +454,7 @@ class EnhancedCNNResearchTrainer:
         print(f"  📉 Weight Decay: {self.weight_decay * 1.5:.6f} (enhanced regularization)")
         print(f"  🛡️ Gradient Clipping: 0.1 max norm (tight control)")
         print(f"  🔗 Components: {len(gpt2_params)} TimesNet + {len(cnn_params)} CNN + {len(classifier_params)} Classifier params")
-        print(f"  ✅ Multi-component ratios will be preserved by performance-sensitive scheduler")
+        print(f"  ✅ Multi-component learning rates configured and preserved across steps")
         
         return optimizer
     
@@ -449,12 +469,24 @@ class EnhancedCNNResearchTrainer:
         total_loss = 0
         correct = 0
         total = 0
+        # After ramp, enable stronger regularization
+        if epoch >= self.reg_ramp_epochs:
+            self.mixup_prob = 0.4
+            self.cutmix_prob = 0.2
         
         # Progress bar for batches
         pbar = tqdm(train_loader, desc="🔄 Training", leave=False)
         
-        for batch_idx, (data, target) in enumerate(pbar):
-            data, target = data.to(self.device), target.to(self.device)
+        for batch_idx, batch in enumerate(pbar):
+            # Support optional continuous target (data, class, cont)
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                data, target_cls, target_cont = batch
+                data, target_cls = data.to(self.device), target_cls.to(self.device)
+                target_cont = target_cont.to(self.device)
+            else:
+                data, target_cls = batch
+                data, target_cls = data.to(self.device), target_cls.to(self.device)
+                target_cont = None
             
             # 🛡️ ENHANCED REGULARIZATION APPLICATION
             # Input noise augmentation - improves model robustness to small perturbations
@@ -466,11 +498,11 @@ class EnhancedCNNResearchTrainer:
             use_cutmix = self.model.training and torch.rand(1) < self.cutmix_prob
             use_mixup = not use_cutmix and self.model.training and torch.rand(1) < self.mixup_prob
             if use_cutmix:
-                data, target_a, target_b, lam = self.cutmix(data, target)
+                data, target_a, target_b, lam = self.cutmix(data, target_cls)
             elif use_mixup:
-                data, target_a, target_b, lam = self.mixup(data, target)
+                data, target_a, target_b, lam = self.mixup(data, target_cls)
             else:
-                target_a, target_b, lam = target, None, 1.0
+                target_a, target_b, lam = target_cls, None, 1.0
             
             self.optimizer.zero_grad()
             
@@ -478,23 +510,37 @@ class EnhancedCNNResearchTrainer:
             if self.scaler is not None:
                 with autocast():
                     output = self.model(data)
-                    
-                    # Enhanced loss calculation with regularization
+                    if isinstance(output, tuple):
+                        logits, ret_pred = output
+                    else:
+                        logits, ret_pred = output, None
+                    # Enhanced loss calculation with regularization; clamp logits to avoid inf in softmax
+                    if isinstance(logits, torch.Tensor):
+                        logits = torch.clamp(logits, -20, 20)
                     if use_mixup or use_cutmix:
                         # MixUp loss: weighted combination of two targets
-                        loss_a = self.label_smoothing(output, target_a)
-                        loss_b = self.label_smoothing(output, target_b)
+                        loss_a = self.label_smoothing(logits, target_a)
+                        loss_b = self.label_smoothing(logits, target_b)
                         loss = lam * loss_a + (1 - lam) * loss_b
                     else:
                         # Standard loss with label smoothing
-                        loss = self.label_smoothing(output, target_a)
+                        loss = self.label_smoothing(logits, target_a)
+                    # Optional regression auxiliary loss (if available)
+                    if self.use_regression_head and ret_pred is not None and target_cont is not None:
+                        loss = loss + self.lambda_reg * self.regression_loss(ret_pred, target_cont)
                 
                 # Mixed precision backward pass
                 self.scaler.scale(loss).backward()
                 
-                # Tighter gradient clipping to prevent explosion
+                # Tighter gradient clipping to prevent explosion and catch NaNs
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)  # Reduced from 0.3 → Tighter gradient control
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.05)
+                if not torch.isfinite(loss):
+                    print("⚠️  Non-finite loss detected (AMP path). Skipping step and reducing LR.")
+                    for pg in self.optimizer.param_groups:
+                        pg['lr'] = max(pg['lr'] * 0.5, 1e-7)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -510,28 +556,41 @@ class EnhancedCNNResearchTrainer:
                         for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
                             ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
                 
-                # Step scheduler for OneCycleLR (per batch) - mixed precision path
-                if self.scheduler_mode == "onecycle":
-                    self.scheduler.step()
+                # Scheduler step is handled once per batch below
                 
             else:
                 # Standard precision training
                 output = self.model(data)
+                if isinstance(output, tuple):
+                    logits, ret_pred = output
+                else:
+                    logits, ret_pred = output, None
                 
-                # Enhanced loss calculation with regularization
+                # Enhanced loss calculation with regularization; clamp logits to avoid inf in softmax
+                if isinstance(logits, torch.Tensor):
+                    logits = torch.clamp(logits, -20, 20)
                 if use_mixup or use_cutmix:
                     # MixUp loss: weighted combination of two targets
-                    loss_a = self.label_smoothing(output, target_a)
-                    loss_b = self.label_smoothing(output, target_b)
+                    loss_a = self.label_smoothing(logits, target_a)
+                    loss_b = self.label_smoothing(logits, target_b)
                     loss = lam * loss_a + (1 - lam) * loss_b
                 else:
                     # Standard loss with label smoothing
-                    loss = self.label_smoothing(output, target_a)
+                    loss = self.label_smoothing(logits, target_a)
+                # Optional regression auxiliary loss
+                if self.use_regression_head and ret_pred is not None and target_cont is not None:
+                    loss = loss + self.lambda_reg * self.regression_loss(ret_pred, target_cont)
                 
                 loss.backward()
                 
-                # Tighter gradient clipping to prevent explosion
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)  # Reduced from 0.3 → Tighter gradient control
+                # Tighter gradient clipping to prevent explosion and catch NaNs
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.05)
+                if not torch.isfinite(loss):
+                    print("⚠️  Non-finite loss detected (FP32 path). Skipping step and reducing LR.")
+                    for pg in self.optimizer.param_groups:
+                        pg['lr'] = max(pg['lr'] * 0.5, 1e-7)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
                 self.optimizer.step()
 
                 # EMA update (standard precision path)
@@ -545,13 +604,13 @@ class EnhancedCNNResearchTrainer:
                         for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
                             ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
             
-            # Step scheduler for OneCycleLR (per batch)
+            # Step scheduler for OneCycleLR (per batch) – single step for both precision paths
             if self.scheduler_mode == "onecycle":
                 self.scheduler.step()
             
             # Statistics with MixUp-aware accuracy calculation
             total_loss += loss.item()
-            pred = output.argmax(dim=1, keepdim=True)
+            pred = logits.argmax(dim=1, keepdim=True)
             
             # MixUp-aware accuracy: use the primary target for accuracy calculation
             if use_mixup:
@@ -582,6 +641,12 @@ class EnhancedCNNResearchTrainer:
         total_loss = 0
         correct = 0
         total = 0
+        f1_targets = []
+        f1_preds = []
+        prob_targets = []
+        prob_preds = []
+        coverage_counter = 0
+        positive_correct = 0
         
         # Progress bar for validation
         pbar = tqdm(val_loader, desc="🔍 Validating", leave=False)
@@ -590,11 +655,31 @@ class EnhancedCNNResearchTrainer:
             for data, target in pbar:
                 data, target = data.to(self.device), target.to(self.device)
                 output = model_for_eval(data)
-                loss = self.criterion(output, target)
+                if isinstance(output, tuple):
+                    logits, _ = output
+                else:
+                    logits = output
+                loss = self.criterion(logits, target)
                 
                 total_loss += loss.item()
-                pred = output.argmax(dim=1, keepdim=True)
+                pred = logits.argmax(dim=1, keepdim=True)
                 correct += pred.eq(target.view_as(pred)).sum().item()
+                f1_targets.append(target.cpu().numpy())
+                f1_preds.append(pred.view(-1).cpu().numpy())
+                # store probabilities for AUROC (one-vs-rest)
+                # Apply temperature scaling if enabled
+                if self.use_temperature_scaling:
+                    logits_for_prob = logits / self.temperature.clamp_min(1e-3)
+                else:
+                    logits_for_prob = logits
+                probs = torch.softmax(logits_for_prob, dim=1).detach().cpu().numpy()
+                prob_preds.append(probs)
+                prob_targets.append(target.detach().cpu().numpy())
+                # Selective prediction (example on class 2 'up')
+                up_prob = probs[:, 2] if probs.shape[1] >= 3 else probs.max(axis=1)
+                take_mask = up_prob >= self.select_threshold
+                coverage_counter += take_mask.sum()
+                positive_correct += ((pred.view(-1).cpu().numpy() == 2) & take_mask).sum()
                 total += target.size(0)
                 
                 # Update progress bar
@@ -607,8 +692,70 @@ class EnhancedCNNResearchTrainer:
         
         avg_loss = total_loss / len(val_loader)
         accuracy = 100. * correct / total
+        try:
+            y_true = np.concatenate(f1_targets) if f1_targets else np.array([])
+            y_pred = np.concatenate(f1_preds) if f1_preds else np.array([])
+            macro_f1 = f1_score(y_true, y_pred, average='macro') if y_true.size else 0.0
+            # AUROC (OVR) requires probs and at least two classes present
+            auroc = 0.0
+            if prob_targets:
+                y_true_prob = np.concatenate(prob_targets)
+                y_prob = np.concatenate(prob_preds)
+                if len(np.unique(y_true_prob)) > 1:
+                    auroc = roc_auc_score(y_true_prob, y_prob, multi_class='ovr')
+            # Precision@k (top-k by confidence in class 2 "up" as example)
+            precision_at_k = 0.0
+            if prob_targets:
+                k = max(1, int(0.01 * len(y_true)))  # top 1%
+                up_probs = y_prob[:, 2] if y_prob.shape[1] >= 3 else y_prob.max(axis=1)
+                topk_idx = np.argsort(-up_probs)[:k]
+                precision_at_k = (y_true_prob[topk_idx] == 2).mean() if k > 0 else 0.0
+            coverage = coverage_counter / len(y_true_prob) if prob_targets else 0.0
+            selective_precision = (positive_correct / coverage_counter) if coverage_counter > 0 else 0.0
+            print(f"  🎯 Macro-F1: {macro_f1:.3f} | AUROC(OVR): {auroc:.3f} | Precision@1%: {precision_at_k:.3f} | Selective P(up|p>{self.select_threshold}): {selective_precision:.3f} @Coverage {coverage:.2%}")
+        except Exception as e:
+            print(f"⚠️  Metric computation issue: {e}")
         
         return avg_loss, accuracy
+
+    def fit_temperature(self, val_loader: DataLoader, max_iters: int = 100) -> float:
+        """Fit temperature scaling on validation logits to minimize NLL.
+
+        Leaves model weights frozen; only optimizes the scalar temperature.
+        """
+        if not self.use_temperature_scaling:
+            return float(self.temperature.detach().cpu().item())
+        self.model.eval()
+        # Collect logits and labels
+        logits_list, targets_list = [], []
+        with torch.no_grad():
+            for data, target in val_loader:
+                data = data.to(self.device)
+                target = target.to(self.device)
+                output = self.model(data)
+                logits = output[0] if isinstance(output, (list, tuple)) else output
+                logits_list.append(logits.detach())
+                targets_list.append(target.detach())
+        logits_all = torch.cat(logits_list, dim=0)
+        targets_all = torch.cat(targets_list, dim=0)
+        # Optimize temperature
+        nll_loss = nn.CrossEntropyLoss()
+        optimizer = torch.optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
+        self.temperature.data.clamp_(min=1e-3)
+
+        def _closure():
+            optimizer.zero_grad()
+            scaled = logits_all / self.temperature.clamp_min(1e-3)
+            loss = nll_loss(scaled, targets_all)
+            loss.backward()
+            return loss
+
+        try:
+            optimizer.step(_closure)
+        except Exception:
+            pass
+        self.temperature.data.clamp_(min=1e-3)
+        return float(self.temperature.detach().cpu().item())
     
     def _evaluate_swa_model(self, val_loader: DataLoader) -> tuple:
         """Evaluate the SWA (Stochastic Weight Averaging) model performance"""
@@ -624,10 +771,11 @@ class EnhancedCNNResearchTrainer:
             for data, target in val_loader:
                 data, target = data.to(self.device), target.to(self.device)
                 output = self.swa_model(data)
-                loss = self.criterion(output, target)
+                logits = output[0] if isinstance(output, (list, tuple)) else output
+                loss = self.criterion(logits, target)
                 
                 total_loss += loss.item()
-                pred = output.argmax(dim=1, keepdim=True)
+                pred = logits.argmax(dim=1, keepdim=True)
                 correct += pred.eq(target.view_as(pred)).sum().item()
                 total += target.size(0)
         
@@ -649,15 +797,18 @@ class EnhancedCNNResearchTrainer:
         if self.lr_strategy == 'onecycle' and self.scheduler is None:
             steps_per_epoch = len(train_loader)
             total_steps = epochs * steps_per_epoch
+            # Use per-param-group max_lr to preserve ratios and keep schedule conservative (1.5x)
+            max_lrs = [pg['lr'] * 1.5 for pg in self.optimizer.param_groups]
             self.scheduler = OneCycleLR(
-                self.optimizer, 
-                max_lr=self.learning_rate * 3,  # Peak LR 3x higher than base
+                self.optimizer,
+                max_lr=max_lrs,
                 total_steps=total_steps,
-                pct_start=0.3,  # 30% warmup, 70% cooldown
-                cycle_momentum=False,  # For AdamW
-                anneal_strategy='cos'  # Cosine annealing
+                pct_start=0.5,  # slower warmup to avoid early blow-ups
+                cycle_momentum=False,
+                anneal_strategy='cos'
             )
-            print(f"🔄 OneCycleLR initialized: {total_steps} total steps, max_lr={self.learning_rate * 3:.2e}")
+            pretty_max = ", ".join(f"{lr:.2e}" for lr in max_lrs)
+            print(f"🔄 OneCycleLR initialized: {total_steps} total steps, max_lr per group=[{pretty_max}]")
         
         print(f"🚀 Starting research training for {epochs} epochs...")
         print(f"📊 Training samples: {len(train_loader.dataset):,}")
@@ -1166,7 +1317,7 @@ def main():
     # Combined with extended training and enhanced regularization for 60%+ target
     batch_size = 256              # Larger effective batch for stability; use AMP and gradient clipping
     epochs = 150                 # Extended for proven adaptive method → Should reach 55-60% faster
-    learning_rate = 2.8e-4       # Set to your observed optimal value → Adaptive scheduler will build on this
+    learning_rate = 2.8e-4       # Restored proven base LR to avoid instability with OneCycle
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
     test_size = 0.2
     random_state = 42
@@ -1193,7 +1344,7 @@ def main():
     
     # Load and clean data again for dataset creation (since we need raw unscaled data)
     df = pd.read_csv(csv_path)
-    feature_columns = [col for col in df.columns if col not in ['Ticker', 'Label']]
+    feature_columns = [col for col in df.columns if col not in ['Ticker', 'Label', 'TargetRet']]
     
     # Remove NaN rows (same as in load_and_preprocess_data)
     nan_rows = df[feature_columns].isna().any(axis=1)
@@ -1202,16 +1353,27 @@ def main():
     X_raw = df_clean[feature_columns].values.astype(np.float32)
     y_raw = df_clean['Label'].values.astype(np.int64)
     
-    # Split raw data
+    # Split raw data (will be replaced by purged CV when enabled)
     X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
         X_raw, y_raw, test_size=test_size, random_state=random_state, stratify=y_raw
     )
     
+    # If continuous target present, keep alongside for an optional regression head
+    target_ret = None
+    if 'TargetRet' in df_clean.columns:
+        target_ret = df_clean['TargetRet'].values.astype(np.float32)
+        y_train_ret = target_ret[~nan_rows].reshape(-1)[train_test_split(np.arange(len(X_raw)), test_size=test_size, random_state=random_state, stratify=y_raw)[0]] if False else None
     train_dataset = FinancialDataset(X_train_raw, y_train_raw)
     test_dataset = FinancialDataset(X_test_raw, y_test_raw)
     
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # Create data loaders with class-balanced sampling for training
+    class_sample_counts = np.bincount(y_train_raw)
+    class_weights_sampler = 1.0 / np.clip(class_sample_counts, 1, None)
+    sample_weights = class_weights_sampler[y_train_raw]
+    from torch.utils.data.sampler import WeightedRandomSampler
+    train_sampler = WeightedRandomSampler(weights=torch.DoubleTensor(sample_weights), num_samples=len(sample_weights), replacement=True)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # ----- Model Selection -----
@@ -1264,13 +1426,57 @@ def main():
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None
     )
     
-    # Train model
-    history = trainer.train(
-        train_loader=train_loader,
-        val_loader=test_loader,
-        epochs=epochs,
-        save_dir=save_dir
-    )
+    # Optional: Purged Time-Series CV with embargo (opt-in)
+    use_cv = False  # set True to enable
+    embargo_frac = 0.02
+    n_splits = 5
+
+    if use_cv:
+        n = len(X_raw)
+        kf = KFold(n_splits=n_splits, shuffle=False)
+        fold = 0
+        best_macro_f1 = -1.0
+        for train_idx, val_idx in kf.split(np.arange(n)):
+            fold += 1
+            # Apply embargo: remove a small fraction around the split boundary from validation indices
+            emb = int(len(val_idx) * embargo_frac)
+            if emb > 0:
+                val_idx = val_idx[emb:-emb] if (len(val_idx) - 2*emb) > 0 else val_idx
+            X_tr, y_tr = X_raw[train_idx], y_raw[train_idx]
+            X_va, y_va = X_raw[val_idx], y_raw[val_idx]
+            tr_ds = FinancialDataset(X_tr, y_tr)
+            va_ds = FinancialDataset(X_va, y_va)
+            tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
+            va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
+            print(f"\n🧪 Fold {fold}/{n_splits} (embargo {embargo_frac*100:.1f}%): train={len(tr_ds)}, val={len(va_ds)}")
+            fold_trainer = EnhancedCNNResearchTrainer(
+                model=create_timesnet_hybrid(features_per_day=features_per_day, num_classes=3, cnn_channels=512, timesnet_emb=512, timesnet_depth=5),
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                class_weights=class_weights
+            )
+            fold_hist = fold_trainer.train(tr_loader, va_loader, epochs=epochs, save_dir=save_dir)
+            # Fit temperature per fold
+            if getattr(fold_trainer, 'use_temperature_scaling', False):
+                temp_value = fold_trainer.fit_temperature(va_loader)
+                print(f"🌡️  Fold {fold} temperature: {temp_value:.3f}")
+            # Track best by Macro-F1 (printed in validation); here we fallback to best val acc
+            if fold_trainer.best_val_acc > best_macro_f1:
+                best_macro_f1 = fold_trainer.best_val_acc
+        print(f"\n✅ CV completed. Best fold metric: {best_macro_f1:.2f}")
+        history = {"cv_best": best_macro_f1}
+    else:
+        # Train model (single split)
+        history = trainer.train(
+            train_loader=train_loader,
+            val_loader=test_loader,
+            epochs=epochs,
+            save_dir=save_dir
+        )
+        # Fit temperature on validation set for calibrated probabilities
+        if getattr(trainer, 'use_temperature_scaling', False):
+            temp_value = trainer.fit_temperature(test_loader)
+            print(f"🌡️  Fitted temperature: {temp_value:.3f}")
     
     # Plot training curves
     trainer.plot_training_curves(os.path.join(save_dir, 'training_curves.png'))
@@ -1287,11 +1493,14 @@ def main():
         print(f"  🏆 Best accuracy achieved: {lr_summary['best_accuracy']:.2f}%")
         print(f"  📊 LR performance analysis saved to: {lr_analysis_path}")
     
-    # Print final results
+    # Print final results (guard if training aborted early)
     print("\n🎉 Research training completed!")
-    print(f"🏆 Best validation accuracy: {max(history['val_accuracies']):.2f}%")
-    print(f"📉 Best validation loss: {min(history['val_losses']):.4f}")
-    if hasattr(trainer, 'swa_model') and trainer.swa_model is not None:
+    if isinstance(history, dict) and 'val_accuracies' in history and 'val_losses' in history and history.get('val_accuracies') and history.get('val_losses'):
+        print(f"🏆 Best validation accuracy: {max(history['val_accuracies']):.2f}%")
+        print(f"📉 Best validation loss: {min(history['val_losses']):.4f}")
+    else:
+        print("⚠️  No validation metrics available (training ended before first epoch)")
+    if hasattr(trainer, 'swa_model') and getattr(trainer, 'swa_model', None) is not None:
         print(f"🚀 SWA model was used for final accuracy boost!")
     print(f"📁 Training history saved to: {save_dir}/training_history.json")
     print(f"💾 Best model saved to: {save_dir}/enhanced_cnn_best.pth")
