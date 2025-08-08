@@ -86,11 +86,11 @@ class ProfessionalDataCollector:
             "tickers": self._get_default_tickers(),
             # Labeling configuration
             # label_mode: 'rolling_quantiles' (original) or 'absolute_bands'
-            "label_mode": "rolling_quantiles",
+            "label_mode": "absolute_bands",
             # For absolute_bands: define neutral band and up/down thresholds (daily returns)
             # Example: neutral if |ret| <= 0.0015 (0.15%), up if ret >= 0.003 (0.30%), down if ret <= -0.003
-            "neutral_band": 0.0015,
-            "up_down_threshold": 0.003
+            "neutral_band": 0.002,
+            "up_down_threshold": 0.0035
         }
         
         logger.info(f"🏗️ Data Collector initialized")

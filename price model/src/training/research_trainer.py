@@ -321,6 +321,15 @@ class EnhancedCNNResearchTrainer:
         self.temperature = torch.nn.Parameter(torch.ones(1, device=self.device), requires_grad=True)
         self.use_temperature_scaling = True
         self.select_threshold = 0.6  # abstain below this probability
+        # Freeze/unfreeze schedule and loss curriculum
+        self.freeze_timesnet_epochs = 5
+        self.focal_start_epoch = 12
+        # Label curriculum using continuous target
+        self.use_label_curriculum = True
+        self.neutral_band_early = 0.002
+        self.updown_thr_early = 0.0035
+        self.neutral_band_late = 0.0015
+        self.updown_thr_late = 0.003
         
         print(f"🛡️ Regularization enabled:")
         print(f"  📊 MixUp: α=0.2, prob={int(self.mixup_prob*100)}% → Early epochs softened")
@@ -362,15 +371,27 @@ class EnhancedCNNResearchTrainer:
     
     def _analyze_components(self):
         """Analyze model components for monitoring"""
-        gpt2_params = sum(p.numel() for name, p in self.model.named_parameters() if 'timesnet' in name)
-        cnn_params = sum(p.numel() for name, p in self.model.named_parameters() if 'cnn' in name)
-        classifier_params = sum(p.numel() for name, p in self.model.named_parameters() if 'classifier' in name)
+        gpt2_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('timesnet'))
+        cnn_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('cnn'))
+        gate_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('gate'))
+        trunk_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('trunk'))
+        head_class_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('head_class'))
+        head_reg_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('head_reg'))
+        other_params = sum(p.numel() for name, p in self.model.named_parameters()
+                           if not (name.startswith('timesnet') or name.startswith('cnn') or name.startswith('gate')
+                                   or name.startswith('trunk') or name.startswith('head_class') or name.startswith('head_reg')))
+        total = sum(p.numel() for p in self.model.parameters())
         
         print(f"🔍 Model Component Analysis:")
         print(f"  🧠 TimesNet Encoder: {gpt2_params:,} parameters")
-        print(f"  🎯 CNN Branch: {cnn_params:,} parameters")  
-        print(f"  🎨 Classifier: {classifier_params:,} parameters")
-        print(f"  📊 Total: {gpt2_params + cnn_params + classifier_params:,} parameters")
+        print(f"  🎯 CNN Branch: {cnn_params:,} parameters")
+        print(f"  🔀 Gate: {gate_params:,} parameters")
+        print(f"  🧱 Trunk: {trunk_params:,} parameters")
+        print(f"  🎨 Head (classification): {head_class_params:,} parameters")
+        print(f"  📈 Head (regression): {head_reg_params:,} parameters")
+        if other_params:
+            print(f"  🧩 Other: {other_params:,} parameters")
+        print(f"  📊 Total (sum of all): {total:,} parameters")
     
     def _reset_lr_tracking(self):
         """Reset LR tracking variables when LR changes"""
@@ -468,6 +489,15 @@ class EnhancedCNNResearchTrainer:
         # 🎛️ Update adaptive dropout rates based on training progress
         if hasattr(self.model, 'set_epoch'):
             self.model.set_epoch(epoch, total_epochs)
+
+        # Freeze/unfreeze schedule: linear probe for first few epochs
+        if epoch < getattr(self, 'freeze_timesnet_epochs', 0):
+            for name, p in self.model.named_parameters():
+                if name.startswith('timesnet'):
+                    p.requires_grad_(False)
+        elif getattr(self, 'freeze_timesnet_epochs', 0) > 0 and epoch == self.freeze_timesnet_epochs:
+            for p in self.model.parameters():
+                p.requires_grad_(True)
             
         total_loss = 0
         correct = 0
@@ -521,14 +551,17 @@ class EnhancedCNNResearchTrainer:
                     # Enhanced loss calculation with regularization; clamp logits to avoid inf in softmax
                     if isinstance(logits, torch.Tensor):
                         logits = torch.clamp(logits, -20, 20)
+                    # Loss curriculum: CE until focal_start_epoch, then Focal
+                    use_focal = epoch >= getattr(self, 'focal_start_epoch', 0)
                     if use_mixup or use_cutmix:
                         # MixUp loss: weighted combination of two targets
-                        loss_a = self.label_smoothing(logits, target_a)
-                        loss_b = self.label_smoothing(logits, target_b)
+                        base_loss_fn = self.label_smoothing if not use_focal else (lambda z, y: self.criterion(z, y))
+                        loss_a = base_loss_fn(logits, target_a)
+                        loss_b = base_loss_fn(logits, target_b)
                         loss = lam * loss_a + (1 - lam) * loss_b
                     else:
                         # Standard loss with label smoothing
-                        loss = self.label_smoothing(logits, target_a)
+                        loss = (self.criterion if use_focal else self.label_smoothing)(logits, target_a)
                     # Optional regression auxiliary loss (if available)
                     if self.use_regression_head and ret_pred is not None and target_cont is not None:
                         loss = loss + self.lambda_reg * self.regression_loss(ret_pred, target_cont)
@@ -573,14 +606,17 @@ class EnhancedCNNResearchTrainer:
                 # Enhanced loss calculation with regularization; clamp logits to avoid inf in softmax
                 if isinstance(logits, torch.Tensor):
                     logits = torch.clamp(logits, -20, 20)
+                # Loss curriculum: CE until focal_start_epoch, then Focal
+                use_focal = epoch >= getattr(self, 'focal_start_epoch', 0)
                 if use_mixup or use_cutmix:
                     # MixUp loss: weighted combination of two targets
-                    loss_a = self.label_smoothing(logits, target_a)
-                    loss_b = self.label_smoothing(logits, target_b)
+                    base_loss_fn = self.label_smoothing if not use_focal else (lambda z, y: self.criterion(z, y))
+                    loss_a = base_loss_fn(logits, target_a)
+                    loss_b = base_loss_fn(logits, target_b)
                     loss = lam * loss_a + (1 - lam) * loss_b
                 else:
                     # Standard loss with label smoothing
-                    loss = self.label_smoothing(logits, target_a)
+                    loss = (self.criterion if use_focal else self.label_smoothing)(logits, target_a)
                 # Optional regression auxiliary loss
                 if self.use_regression_head and ret_pred is not None and target_cont is not None:
                     loss = loss + self.lambda_reg * self.regression_loss(ret_pred, target_cont)
@@ -1450,7 +1486,7 @@ def main():
             timesnet_emb=512,
             timesnet_depth=5,
             seq_len=5,
-            patch_len=2,
+            patch_len=3,
             patch_stride=1,
             use_series_norm=True
         )
