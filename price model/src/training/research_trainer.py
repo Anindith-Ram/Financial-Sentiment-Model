@@ -1215,11 +1215,11 @@ class EnhancedCNNResearchTrainer:
             return
         
         try:
-            plt.figure(figsize=(16, 6))
+            plt.figure(figsize=(20, 8))
             epochs = list(range(1, len(self.train_losses) + 1))
             
             # Loss curves
-            plt.subplot(1, 3, 1)
+            plt.subplot(2, 3, 1)
             plt.plot(epochs, self.train_losses, label='Train Loss', color='#2E86AB', linewidth=2.5)
             plt.plot(epochs, self.val_losses, label='Val Loss', color='#A23B72', linewidth=2.5)
             plt.title('📉 Training & Validation Loss', fontsize=14, fontweight='bold')
@@ -1229,7 +1229,7 @@ class EnhancedCNNResearchTrainer:
             plt.grid(True, alpha=0.3)
             
             # Accuracy curves  
-            plt.subplot(1, 3, 2)
+            plt.subplot(2, 3, 2)
             plt.plot(epochs, self.train_accuracies, label='Train Accuracy', color='#2E86AB', linewidth=2.5)
             plt.plot(epochs, self.val_accuracies, label='Val Accuracy', color='#A23B72', linewidth=2.5)
             if getattr(self, 'val_macro_f1s', None):
@@ -1241,7 +1241,7 @@ class EnhancedCNNResearchTrainer:
             plt.grid(True, alpha=0.3)
             
             # Learning rate and performance
-            plt.subplot(1, 3, 3)
+            plt.subplot(2, 3, 3)
             ax1 = plt.gca()
             ax2 = ax1.twinx()
             
@@ -1269,6 +1269,30 @@ class EnhancedCNNResearchTrainer:
                 ax1.axvline(x=best_epoch, color='green', linestyle=':', alpha=0.7, linewidth=2)
                 ax1.text(best_epoch, max(self.val_accuracies), f'Best: {max(self.val_accuracies):.1f}%', 
                         rotation=90, verticalalignment='bottom', fontweight='bold')
+
+            # AUROC panel
+            plt.subplot(2, 3, 4)
+            if getattr(self, 'val_aurocs', None):
+                plt.plot(epochs[:len(self.val_aurocs)], self.val_aurocs, label='AUROC (OVR)', color='#8E44AD', linewidth=2.5)
+                plt.ylim(0.0, 1.0)
+            plt.title('📐 Validation AUROC', fontsize=14, fontweight='bold')
+            plt.xlabel('Epoch')
+            plt.ylabel('AUROC')
+            if getattr(self, 'val_aurocs', None):
+                plt.legend()
+            plt.grid(True, alpha=0.3)
+
+            # Precision@k panel (k=top 1%)
+            plt.subplot(2, 3, 5)
+            if getattr(self, 'val_precision_at_k', None):
+                plt.plot(epochs[:len(self.val_precision_at_k)], self.val_precision_at_k, label='Precision@1%', color='#16A085', linewidth=2.5)
+                plt.ylim(0.0, 1.0)
+            plt.title('🎯 Precision@Top-1%', fontsize=14, fontweight='bold')
+            plt.xlabel('Epoch')
+            plt.ylabel('Precision')
+            if getattr(self, 'val_precision_at_k', None):
+                plt.legend()
+            plt.grid(True, alpha=0.3)
             
             plt.tight_layout()
             plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
@@ -1421,7 +1445,11 @@ def main():
             num_classes=3,
             cnn_channels=512,
             timesnet_emb=512,
-            timesnet_depth=5
+            timesnet_depth=5,
+            seq_len=5,
+            patch_len=2,
+            patch_stride=1,
+            use_series_norm=True
         )
     elif MODEL_TYPE == "simple_cnn":
         from src.training.simple_cnn_trainer import SimpleCNN  # Lazy import

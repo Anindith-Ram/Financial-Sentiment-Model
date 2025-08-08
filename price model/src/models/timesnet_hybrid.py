@@ -61,16 +61,52 @@ class MultiScaleCNN(nn.Module):
 # ---------------------------------------------------------------------------
 # Minimal TimesNet-style encoder
 # ---------------------------------------------------------------------------
-class PatchEmbedding(nn.Module):
-    """Patchify the sequence – for 5-day window we take patch length 1 (day)."""
+class PerSeriesNorm(nn.Module):
+    """Normalize each feature (series) per sample across time.
 
-    def __init__(self, in_features: int, emb_dim: int):
+    For input x of shape (B, T, F): subtract mean over T for each feature and divide by std.
+    """
+
+    def __init__(self, eps: float = 1e-5):
         super().__init__()
-        self.proj = nn.Linear(in_features, emb_dim)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True)
+        return (x - mean) / (std + self.eps)
+
+
+class PatchEmbedding(nn.Module):
+    """Time patch embedding similar to PatchTST: patch along time, project to emb_dim.
+
+    Args:
+        in_features: number of variables per time step (F)
+        emb_dim: embedding dimension
+        seq_len: total time steps (T)
+        patch_len: patch length along time (P)
+        stride: step size for patching (S)
+    """
+
+    def __init__(self, in_features: int, emb_dim: int, seq_len: int, patch_len: int = 1, stride: int = 1):
+        super().__init__()
+        self.in_features = in_features
+        self.emb_dim = emb_dim
+        self.patch_len = patch_len
+        self.stride = stride
+        # number of patches computed as floor((T - P)/S) + 1 at runtime using provided seq_len
+        self.num_patches = max(1, (seq_len - patch_len) // stride + 1)
+        self.linear = nn.Linear(in_features * patch_len, emb_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x : (B, T, F)
-        return self.proj(x)  # (B, T, D)
+        # Create time patches: (B, num_patches, patch_len, F)
+        B, T, F = x.shape
+        num_patches = max(1, (T - self.patch_len) // self.stride + 1)
+        # unfold over time dimension
+        patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)  # (B, num_patches, patch_len, F)
+        patches = patches.contiguous().view(B, num_patches, self.patch_len * F)  # (B, num_patches, F*P)
+        return self.linear(patches)  # (B, num_patches, D)
 
 
 class TimesBlock(nn.Module):
@@ -97,13 +133,17 @@ class TimesBlock(nn.Module):
 
 
 class TimesNetEncoder(nn.Module):
-    """Stack of TimesBlocks with learnable [CLS] token."""
+    """Stack of TimesBlocks with learnable [CLS] token and PatchTST-style embedding."""
 
-    def __init__(self, in_features: int = 62, emb_dim: int = 192, depth: int = 3):
+    def __init__(self, in_features: int = 62, emb_dim: int = 192, depth: int = 3,
+                 seq_len: int = 5, patch_len: int = 1, stride: int = 1, use_series_norm: bool = True):
         super().__init__()
-        self.patch = PatchEmbedding(in_features, emb_dim)
+        self.use_series_norm = use_series_norm
+        self.series_norm = PerSeriesNorm() if use_series_norm else nn.Identity()
+        self.patch = PatchEmbedding(in_features, emb_dim, seq_len=seq_len, patch_len=patch_len, stride=stride)
+        num_patches = self.patch.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, emb_dim))
-        self.pos_emb = nn.Parameter(torch.zeros(1, 6, emb_dim))  # 5 days + CLS
+        self.pos_emb = nn.Parameter(torch.zeros(1, num_patches + 1, emb_dim))
         self.blocks = nn.ModuleList([TimesBlock(emb_dim) for _ in range(depth)])
         self.norm = nn.LayerNorm(emb_dim)
         self._init_weights()
@@ -113,10 +153,20 @@ class TimesNetEncoder(nn.Module):
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x : (B, T=5, F)
-        x = self.patch(x)  # (B, 5, D)
+        # x : (B, T, F)
+        x = self.series_norm(x)
+        x = self.patch(x)  # (B, num_patches, D)
         cls_tokens = self.cls_token.repeat(x.size(0), 1, 1)  # (B,1,D)
-        x = torch.cat([cls_tokens, x], dim=1) + self.pos_emb  # (B,6,D)
+        # pad/crop positional embedding if sequence length changed dynamically
+        pe = self.pos_emb
+        if pe.size(1) != x.size(1) + 1:
+            # interpolate by truncation or repeat last
+            if pe.size(1) > x.size(1) + 1:
+                pe = pe[:, :x.size(1) + 1, :]
+            else:
+                pad = pe[:, -1:, :].repeat(1, (x.size(1) + 1 - pe.size(1)), 1)
+                pe = torch.cat([pe, pad], dim=1)
+        x = torch.cat([cls_tokens, x], dim=1) + pe  # (B, num_patches+1, D)
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
@@ -129,10 +179,19 @@ class TimesNetEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 class TimesNetHybrid(nn.Module):
     def __init__(self, features_per_day: int = 62, num_classes: int = 5,
-                 cnn_channels: int = 512, timesnet_emb: int = 512, timesnet_depth: int = 5):
+                 cnn_channels: int = 512, timesnet_emb: int = 512, timesnet_depth: int = 5,
+                 seq_len: int = 5, patch_len: int = 1, patch_stride: int = 1, use_series_norm: bool = True):
         super().__init__()
         self.cnn = MultiScaleCNN(features_per_day, out_channels=cnn_channels)  # ➜ 3*cnn_channels-d (bigger)
-        self.timesnet = TimesNetEncoder(in_features=features_per_day, emb_dim=timesnet_emb, depth=timesnet_depth)
+        self.timesnet = TimesNetEncoder(
+            in_features=features_per_day,
+            emb_dim=timesnet_emb,
+            depth=timesnet_depth,
+            seq_len=seq_len,
+            patch_len=patch_len,
+            stride=patch_stride,
+            use_series_norm=use_series_norm
+        )
         fused_dim = cnn_channels * 3  # from MultiScaleCNN concat
         times_dim = timesnet_emb
         self.gate = nn.Sequential(
@@ -169,10 +228,14 @@ class TimesNetHybrid(nn.Module):
 # ---------------------------------------------------------------------------
 
 def create_timesnet_hybrid(features_per_day: int = 62, num_classes: int = 5,
-                            cnn_channels: int = 512, timesnet_emb: int = 512, timesnet_depth: int = 5):
+                            cnn_channels: int = 512, timesnet_emb: int = 512, timesnet_depth: int = 5,
+                            seq_len: int = 5, patch_len: int = 1, patch_stride: int = 1,
+                            use_series_norm: bool = True):
     """Factory that allows passing bigger model hyperparameters."""
     return TimesNetHybrid(features_per_day=features_per_day, num_classes=num_classes,
-                          cnn_channels=cnn_channels, timesnet_emb=timesnet_emb, timesnet_depth=timesnet_depth)
+                          cnn_channels=cnn_channels, timesnet_emb=timesnet_emb, timesnet_depth=timesnet_depth,
+                          seq_len=seq_len, patch_len=patch_len, patch_stride=patch_stride,
+                          use_series_norm=use_series_norm)
 
 
 if __name__ == "__main__":
