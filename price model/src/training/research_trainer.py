@@ -64,11 +64,11 @@ def load_and_preprocess_data(csv_path: str = "data/reduced_feature_set_dataset.c
     df = pd.read_csv(csv_path)
 
     # Identify potential date col and close column
-    date_col = next((c for c in ["Date","date","Timestamp","timestamp"] if c in df.columns), None)
+    date_col = next((c for c in ["EndDate","Date","date","Timestamp","timestamp"] if c in df.columns), None)
     close_col = next((c for c in ["Close","Adj Close","Adj_Close"] if c in df.columns), None)
 
     # Build feature list excluding non-features
-    feature_columns = [c for c in df.columns if c not in ["Ticker","Label"]]
+    feature_columns = [c for c in df.columns if c not in ["Ticker","Label","TargetRet","EndDate"]]
     if date_col:
         feature_columns = [c for c in feature_columns if c != date_col]
 
@@ -1380,7 +1380,7 @@ def main():
     
     # Load and clean data again for dataset creation (since we need raw unscaled data)
     df = pd.read_csv(csv_path)
-    feature_columns = [col for col in df.columns if col not in ['Ticker', 'Label', 'TargetRet']]
+    feature_columns = [col for col in df.columns if col not in ['Ticker', 'Label', 'TargetRet', 'EndDate']]
     
     # Remove NaN rows (same as in load_and_preprocess_data)
     nan_rows = df[feature_columns].isna().any(axis=1)
@@ -1472,18 +1472,26 @@ def main():
     n_splits = 5
 
     if use_cv:
-        n = len(X_raw)
+        # Chronological fold split driven by EndDate
+        if 'EndDate' not in df_clean.columns:
+            raise ValueError("Purged CV requires 'EndDate' column. Re-run data collection.")
+        # Sort globally by EndDate
+        df_sorted = df_clean.sort_values('EndDate').reset_index(drop=True)
+        X_sorted = df_sorted[feature_columns].values.astype(np.float32)
+        y_sorted = df_sorted['Label'].values.astype(np.int64)
+        dates_sorted = pd.to_datetime(df_sorted['EndDate']).values
+        n = len(df_sorted)
         kf = KFold(n_splits=n_splits, shuffle=False)
         fold = 0
         best_macro_f1 = -1.0
         for train_idx, val_idx in kf.split(np.arange(n)):
             fold += 1
-            # Apply embargo: remove a small fraction around the split boundary from validation indices
+            # Apply embargo around validation block boundary (by index range in chronological order)
             emb = int(len(val_idx) * embargo_frac)
-            if emb > 0:
-                val_idx = val_idx[emb:-emb] if (len(val_idx) - 2*emb) > 0 else val_idx
-            X_tr, y_tr = X_raw[train_idx], y_raw[train_idx]
-            X_va, y_va = X_raw[val_idx], y_raw[val_idx]
+            if emb > 0 and (len(val_idx) - 2*emb) > 0:
+                val_idx = val_idx[emb:-emb]
+            X_tr, y_tr = X_sorted[train_idx], y_sorted[train_idx]
+            X_va, y_va = X_sorted[val_idx], y_sorted[val_idx]
             tr_ds = FinancialDataset(X_tr, y_tr)
             va_ds = FinancialDataset(X_va, y_va)
             tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)

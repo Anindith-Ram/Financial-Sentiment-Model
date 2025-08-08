@@ -369,6 +369,9 @@ class ProfessionalDataCollector:
             sequence_record['Label'] = label  # 0/1/2
             # Provide continuous target for optional regression head
             sequence_record['TargetRet'] = float(df.iloc[i+sequence_length]['ret1']) if not pd.isna(df.iloc[i+sequence_length]['ret1']) else 0.0
+            # Chronological key for Purged CV
+            end_dt = pd.to_datetime(df.iloc[i+sequence_length]['Date'])
+            sequence_record['EndDate'] = end_dt.strftime('%Y-%m-%d')
             sequence_record['Ticker'] = df.iloc[i+sequence_length]['Ticker']
             
             sequences.append(sequence_record)
