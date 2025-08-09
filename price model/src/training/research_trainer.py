@@ -39,6 +39,7 @@ from src.training.advanced_lr_scheduler import PerformanceSensitiveLRScheduler
 from sklearn.metrics import f1_score, roc_auc_score
 
 from src.models.timesnet_hybrid import create_timesnet_hybrid
+from src.models.resnet_timeseries import create_resnet_time_series
 from src.models.timesnet_hybrid_optimized import create_optimized_timesnet_hybrid
 
 # PROFESSIONAL ENHANCEMENTS - NEW PERFORMANCE FEATURES
@@ -78,28 +79,38 @@ def load_and_preprocess_data(csv_path: str = "data/reduced_feature_set_dataset.c
     if nan_rows.any():
         print(f"⚠️  Removed {nan_rows.sum():,} rows with NaN values")
 
-    # Generate 3-class labels
-    if date_col and close_col:
-        df_clean = df_clean.sort_values(["Ticker", date_col])
-        df_clean["ret1"] = df_clean.groupby("Ticker")[close_col].pct_change().shift(-1)
-        past_ret = df_clean.groupby("Ticker")["ret1"].shift(1)
-        q33 = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(252, min_periods=60).quantile(0.33))
-        q66 = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(252, min_periods=60).quantile(0.66))
-        labels_3 = np.where(df_clean["ret1"] < q33, 0, np.where(df_clean["ret1"] > q66, 2, 1))
-        nan_mask = np.isnan(q33) | np.isnan(q66)
-        if nan_mask.any():
-            med = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(60, min_periods=20).median())
-            labels_3[nan_mask] = np.where(df_clean.loc[nan_mask, "ret1"] < med[nan_mask], 0, 2)
-            labels_3 = np.where(np.isnan(df_clean["ret1"]) & nan_mask, 1, labels_3)
-        df_clean["Label_3"] = labels_3.astype(np.int64)
-        target_col = "Label_3"
+    # Choose target labels
+    # If a 0/1/2 label column already exists, use it directly to avoid remapping
+    if 'Label' in df_clean.columns and set(np.unique(df_clean['Label'].dropna().values)).issubset({0,1,2}):
+        target_col = 'Label'
     else:
-        # Fallback mapping 5→3 classes
-        if 'Label' not in df_clean.columns:
-            raise ValueError("No Label and no price columns to compute 3-class labels.")
-        map3 = {0:0,1:0,2:1,3:2,4:2}
-        df_clean['Label_3'] = df_clean['Label'].map(map3).astype(np.int64)
-        target_col = 'Label_3'
+        # Generate 3-class labels if raw prices are available; otherwise map 5→3
+        if date_col and close_col:
+            df_clean = df_clean.sort_values(["Ticker", date_col])
+            df_clean["ret1"] = df_clean.groupby("Ticker")[close_col].pct_change().shift(-1)
+            past_ret = df_clean.groupby("Ticker")["ret1"].shift(1)
+            q33 = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(252, min_periods=60).quantile(0.33))
+            q66 = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(252, min_periods=60).quantile(0.66))
+            labels_3 = np.where(df_clean["ret1"] < q33, 0, np.where(df_clean["ret1"] > q66, 2, 1))
+            nan_mask = np.isnan(q33) | np.isnan(q66)
+            if nan_mask.any():
+                med = past_ret.groupby(df_clean["Ticker"]).transform(lambda s: s.rolling(60, min_periods=20).median())
+                labels_3[nan_mask] = np.where(df_clean.loc[nan_mask, "ret1"] < med[nan_mask], 0, 2)
+                labels_3 = np.where(np.isnan(df_clean["ret1"]) & nan_mask, 1, labels_3)
+            df_clean["Label_3"] = labels_3.astype(np.int64)
+            target_col = "Label_3"
+        else:
+            if 'Label' not in df_clean.columns:
+                raise ValueError("No Label and no price columns to compute 3-class labels.")
+            # Map potential 5-class labels to 3; values already in {0,1,2} will be left if not in map
+            map3 = {0:0,1:0,2:1,3:2,4:2}
+            mapped = df_clean['Label'].map(map3)
+            # If mapping produced NaNs (already 0/1/2), fall back to original
+            if mapped.isna().mean() < 1.0:
+                df_clean['Label_3'] = mapped.fillna(df_clean['Label']).astype(np.int64)
+                target_col = 'Label_3'
+            else:
+                target_col = 'Label'
 
     # Time-aware split per ticker if possible
     if date_col:
@@ -139,6 +150,7 @@ def load_and_preprocess_data(csv_path: str = "data/reduced_feature_set_dataset.c
 
     print(f"📈 Dataset shape (train/test): {X_train.shape} / {X_test.shape}")
     print(f"🔢 Features per sample: {X_train.shape[1]}")
+    print(f"🧾 Feature columns used ({len(feature_columns)}): {feature_columns[:10]}{' ...' if len(feature_columns)>10 else ''}")
 
     # Class weights (3-class) – ensure weight exists for all 3 classes
     uniq, cnts = np.unique(y_train, return_counts=True)
@@ -164,8 +176,101 @@ def load_and_preprocess_data(csv_path: str = "data/reduced_feature_set_dataset.c
     print(f"🎯 Number of classes: 3")
 
     # Return flat arrays; FinancialDataset reshapes internally
-    return X_train, X_test, y_train, y_test, features_per_day, class_weights
+    return X_train, X_test, y_train, y_test, features_per_day, class_weights, feature_columns
 
+
+def run_sanity_diagnostics(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    feature_names: list,
+    max_train_samples: int = 100_000,
+    max_test_samples: int = 50_000,
+):
+    """Run fast sanity checks to assess feature-label relationship.
+
+    Prints:
+      - Majority-class baseline
+      - Logistic Regression accuracy/F1
+      - Random-label Logistic baseline
+      - Mutual Information per feature (top 20)
+      - RandomForest feature importances (top 20)
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import accuracy_score, f1_score
+        from sklearn.feature_selection import mutual_info_classif
+        from sklearn.ensemble import RandomForestClassifier
+        import numpy as np
+    except Exception as e:
+        print(f"⚠️  Diagnostics skipped (missing sklearn): {e}")
+        return
+
+    # Subsample for speed
+    rng = np.random.default_rng(42)
+    tr_idx = rng.choice(X_train.shape[0], size=min(max_train_samples, X_train.shape[0]), replace=False)
+    te_idx = rng.choice(X_test.shape[0], size=min(max_test_samples, X_test.shape[0]), replace=False)
+    Xtr = X_train[tr_idx]
+    ytr = y_train[tr_idx]
+    Xte = X_test[te_idx]
+    yte = y_test[te_idx]
+
+    print("\n🧪 Sanity diagnostics (sampled):")
+    print(f"  Train sample: {Xtr.shape}, Test sample: {Xte.shape}")
+
+    # Majority baseline
+    majority = np.bincount(ytr).argmax()
+    maj_acc = (yte == majority).mean()
+    print(f"  Majority-class baseline acc: {maj_acc*100:.2f}% (class {majority})")
+
+    # Logistic Regression
+    try:
+        lr = LogisticRegression(max_iter=200, multi_class='multinomial', solver='lbfgs')
+        lr.fit(Xtr, ytr)
+        pred_lr = lr.predict(Xte)
+        acc_lr = accuracy_score(yte, pred_lr)
+        f1_lr = f1_score(yte, pred_lr, average='macro')
+        print(f"  LogisticRegression acc: {acc_lr*100:.2f}% | Macro-F1: {f1_lr:.3f}")
+    except Exception as e:
+        print(f"  ⚠️  LogisticRegression failed: {e}")
+
+    # Random-label test
+    try:
+        ytr_shuf = ytr.copy()
+        rng.shuffle(ytr_shuf)
+        lr_rand = LogisticRegression(max_iter=200, multi_class='multinomial')
+        lr_rand.fit(Xtr, ytr_shuf)
+        pred_rand = lr_rand.predict(Xte)
+        acc_rand = accuracy_score(yte, pred_rand)
+        print(f"  Random-label LR acc: {acc_rand*100:.2f}% (should be near majority baseline)")
+    except Exception as e:
+        print(f"  ⚠️  Random-label baseline failed: {e}")
+
+    # Mutual information
+    try:
+        mi = mutual_info_classif(Xtr, ytr, discrete_features=False, random_state=42)
+        top_idx = np.argsort(mi)[::-1][:20]
+        print("  Top MI features:")
+        for rank, idx in enumerate(top_idx, 1):
+            fname = feature_names[idx] if idx < len(feature_names) else f"f{idx}"
+            print(f"    {rank:2d}. {fname}: MI={mi[idx]:.4f}")
+        print(f"  MI median: {np.median(mi):.4f}, 75th pct: {np.percentile(mi,75):.4f}")
+    except Exception as e:
+        print(f"  ⚠️  Mutual information failed: {e}")
+
+    # RandomForest feature importance
+    try:
+        rf = RandomForestClassifier(n_estimators=100, max_depth=8, n_jobs=-1, random_state=42)
+        rf.fit(Xtr, ytr)
+        imp = rf.feature_importances_
+        top_idx = np.argsort(imp)[::-1][:20]
+        print("  Top RF importances:")
+        for rank, idx in enumerate(top_idx, 1):
+            fname = feature_names[idx] if idx < len(feature_names) else f"f{idx}"
+            print(f"    {rank:2d}. {fname}: IMP={imp[idx]:.4f}")
+    except Exception as e:
+        print(f"  ⚠️  RandomForest importance failed: {e}")
 
 class EnhancedCNNResearchTrainer:
     """
@@ -174,11 +279,14 @@ class EnhancedCNNResearchTrainer:
     
     def __init__(self, model, learning_rate: float = 0.001, weight_decay: float = 1e-4,
                  device: str = "cuda" if torch.cuda.is_available() else "cpu", class_weights=None,
-                 checkpoint_path: str = None, resume_from_epoch: int = 0):
+                 checkpoint_path: str = None, resume_from_epoch: int = 0,
+                 debug_one_batch: bool = False):
         self.model = model.to(device)
         self.device = device
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.debug_one_batch = debug_one_batch
+        self._did_debug_batch = False
         
         # Checkpoint loading support
         self.checkpoint_path = checkpoint_path
@@ -300,19 +408,20 @@ class EnhancedCNNResearchTrainer:
         # MixUp data augmentation - reduces overfitting by creating synthetic training examples
         self.mixup = MixUp(alpha=0.2)
         self.cutmix = CutMix(alpha=0.2)
-        # Softer early regularization; will ramp after warmup epochs
+        # Fixed light regularization throughout
         self.mixup_prob = 0.1
         self.cutmix_prob = 0.0
-        self.reg_ramp_epochs = 15
+        self.reg_ramp_epochs = 0
         
         # Label Smoothing - prevents model from being overconfident
-        self.label_smoothing = LabelSmoothing(smoothing=0.02)  # very mild smoothing early
+        self.label_smoothing = LabelSmoothing(smoothing=0.02)  # mild smoothing
         
         # Enhanced loss function with class weights for severe imbalance
         if class_weights is not None:
             class_weights = torch.FloatTensor(class_weights).to(device)
             print(f"🎯 Using class weights: {class_weights.cpu().numpy()}")
-        self.criterion = FocalLoss(weight=class_weights, gamma=1.5)
+        # Primary CE classification loss for faster early convergence
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
         # Regression loss for optional dual-head (ordinal/regression auxiliary)
         self.use_regression_head = True
         self.lambda_reg = 0.2
@@ -322,8 +431,8 @@ class EnhancedCNNResearchTrainer:
         self.use_temperature_scaling = True
         self.select_threshold = 0.6  # abstain below this probability
         # Freeze/unfreeze schedule and loss curriculum
-        self.freeze_timesnet_epochs = 5
-        self.focal_start_epoch = 12
+        self.freeze_timesnet_epochs = 0
+        self.focal_start_epoch = 10
         # Label curriculum using continuous target
         self.use_label_curriculum = True
         self.neutral_band_early = 0.002
@@ -333,7 +442,7 @@ class EnhancedCNNResearchTrainer:
         
         print(f"🛡️ Regularization enabled:")
         print(f"  📊 MixUp: α=0.2, prob={int(self.mixup_prob*100)}% → Early epochs softened")
-        print(f"  📋 Label Smoothing: 2% → Early stability (will ramp to 5% after {self.reg_ramp_epochs} epochs)")
+        print(f"  📋 Label Smoothing: 2% → Stable throughout")
         print(f"  🔇 Input Noise: 1% strength → Improves robustness")
         
         # 🚀 EMA weights instead of SWA
@@ -372,7 +481,7 @@ class EnhancedCNNResearchTrainer:
     def _analyze_components(self):
         """Analyze model components for monitoring"""
         gpt2_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('timesnet'))
-        cnn_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('cnn'))
+        cnn_params = sum(p.numel() for name, p in self.model.named_parameters() if (name.startswith('cnn') or name.startswith('stem') or name.startswith('layer')))
         gate_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('gate'))
         trunk_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('trunk'))
         head_class_params = sum(p.numel() for name, p in self.model.named_parameters() if name.startswith('head_class'))
@@ -454,11 +563,11 @@ class EnhancedCNNResearchTrainer:
         classifier_params = []
         
         for name, param in self.model.named_parameters():
-            if 'timesnet' in name:
+            if name.startswith('timesnet'):
                 gpt2_params.append(param)
-            elif 'cnn' in name:
+            elif name.startswith('cnn') or name.startswith('stem') or name.startswith('layer'):
                 cnn_params.append(param)
-            elif 'classifier' in name:
+            elif name.startswith('head_class') or name.startswith('head_reg') or 'classifier' in name:
                 classifier_params.append(param)
             else:
                 # Default group for other parameters
@@ -469,13 +578,13 @@ class EnhancedCNNResearchTrainer:
             {'params': gpt2_params, 'lr': self.learning_rate * 0.05},   # TimesNet 0.05x base
             {'params': cnn_params, 'lr': self.learning_rate * 1.0},     # CNN 1.0x
             {'params': classifier_params, 'lr': self.learning_rate * 1.0}  # Head 1.0x
-        ], weight_decay=2e-4, betas=(0.9, 0.999), eps=1e-8)
+        ], weight_decay=1e-4, betas=(0.9, 0.999), eps=1e-8)
         
         print(f"⚙️  Enhanced Multi-Component Optimizer Configuration:")
         print(f"  🧠 TimesNet LR: {self.learning_rate * 0.05:.6f} (0.05x)")
         print(f"  🎯 CNN LR: {self.learning_rate * 1.0:.6f} (1.0x)")
         print(f"  🎨 Classifier LR: {self.learning_rate * 1.0:.6f} (1.0x)")
-        print(f"  📉 Weight Decay: {2e-4:.6f}")
+        print(f"  📉 Weight Decay: {1e-4:.6f}")
         print(f"  🛡️ Gradient Clipping: 0.1 max norm (tight control)")
         print(f"  🔗 Components: {len(gpt2_params)} TimesNet + {len(cnn_params)} CNN + {len(classifier_params)} Classifier params")
         print(f"  ✅ Multi-component learning rates configured and preserved across steps")
@@ -540,6 +649,19 @@ class EnhancedCNNResearchTrainer:
             
             self.optimizer.zero_grad()
             
+            # Debug: print shapes and a sample once at the first batch if requested
+            if self.debug_one_batch and not self._did_debug_batch:
+                with torch.no_grad():
+                    dbg_in = data[:1]
+                    dbg_out = self.model(dbg_in)
+                    dbg_logits = dbg_out[0] if isinstance(dbg_out, (list, tuple)) else dbg_out
+                    per_day = getattr(self.model, 'features_per_day', 'n/a')
+                    print(f"🔎 Debug batch: input shape={data.shape}, per-day features={per_day}")
+                    print(f"🔎 Debug batch: logits shape={dbg_logits.shape} (classes={dbg_logits.shape[-1] if isinstance(dbg_logits, torch.Tensor) else 'n/a'})")
+                    if isinstance(dbg_out, (list, tuple)) and len(dbg_out) > 1 and isinstance(dbg_out[1], torch.Tensor):
+                        print(f"🔎 Debug batch: regression head shape={dbg_out[1].shape}")
+                self._did_debug_batch = True
+
             # Mixed precision forward pass for better performance
             if self.scaler is not None:
                 with autocast():
@@ -551,17 +673,15 @@ class EnhancedCNNResearchTrainer:
                     # Enhanced loss calculation with regularization; clamp logits to avoid inf in softmax
                     if isinstance(logits, torch.Tensor):
                         logits = torch.clamp(logits, -20, 20)
-                    # Loss curriculum: CE until focal_start_epoch, then Focal
-                    use_focal = epoch >= getattr(self, 'focal_start_epoch', 0)
+                    # Classification loss (CE)
                     if use_mixup or use_cutmix:
                         # MixUp loss: weighted combination of two targets
-                        base_loss_fn = self.label_smoothing if not use_focal else (lambda z, y: self.criterion(z, y))
-                        loss_a = base_loss_fn(logits, target_a)
-                        loss_b = base_loss_fn(logits, target_b)
+                        loss_a = self.label_smoothing(logits, target_a)
+                        loss_b = self.label_smoothing(logits, target_b)
                         loss = lam * loss_a + (1 - lam) * loss_b
                     else:
                         # Standard loss with label smoothing
-                        loss = (self.criterion if use_focal else self.label_smoothing)(logits, target_a)
+                        loss = self.label_smoothing(logits, target_a)
                     # Optional regression auxiliary loss (if available)
                     if self.use_regression_head and ret_pred is not None and target_cont is not None:
                         loss = loss + self.lambda_reg * self.regression_loss(ret_pred, target_cont)
@@ -606,17 +726,15 @@ class EnhancedCNNResearchTrainer:
                 # Enhanced loss calculation with regularization; clamp logits to avoid inf in softmax
                 if isinstance(logits, torch.Tensor):
                     logits = torch.clamp(logits, -20, 20)
-                # Loss curriculum: CE until focal_start_epoch, then Focal
-                use_focal = epoch >= getattr(self, 'focal_start_epoch', 0)
+                # Classification loss (CE)
                 if use_mixup or use_cutmix:
                     # MixUp loss: weighted combination of two targets
-                    base_loss_fn = self.label_smoothing if not use_focal else (lambda z, y: self.criterion(z, y))
-                    loss_a = base_loss_fn(logits, target_a)
-                    loss_b = base_loss_fn(logits, target_b)
+                    loss_a = self.label_smoothing(logits, target_a)
+                    loss_b = self.label_smoothing(logits, target_b)
                     loss = lam * loss_a + (1 - lam) * loss_b
                 else:
                     # Standard loss with label smoothing
-                    loss = (self.criterion if use_focal else self.label_smoothing)(logits, target_a)
+                    loss = self.label_smoothing(logits, target_a)
                 # Optional regression auxiliary loss
                 if self.use_regression_head and ret_pred is not None and target_cont is not None:
                     loss = loss + self.lambda_reg * self.regression_loss(ret_pred, target_cont)
@@ -699,7 +817,7 @@ class EnhancedCNNResearchTrainer:
                     logits, _ = output
                 else:
                     logits = output
-                loss = self.criterion(logits, target)
+                loss = self.ce_loss(logits, target)
                 
                 total_loss += loss.item()
                 pred = logits.argmax(dim=1, keepdim=True)
@@ -816,7 +934,7 @@ class EnhancedCNNResearchTrainer:
                 data, target = data.to(self.device), target.to(self.device)
                 output = self.swa_model(data)
                 logits = output[0] if isinstance(output, (list, tuple)) else output
-                loss = self.criterion(logits, target)
+                loss = self.ce_loss(logits, target)
                 
                 total_loss += loss.item()
                 pred = logits.argmax(dim=1, keepdim=True)
@@ -847,7 +965,7 @@ class EnhancedCNNResearchTrainer:
                 self.optimizer,
                 max_lr=max_lrs,
                 total_steps=total_steps,
-                pct_start=0.15,  # faster warmup to reach useful LR
+                pct_start=0.10,  # faster warmup to reach useful LR
                 cycle_momentum=False,
                 anneal_strategy='cos'
             )
@@ -1228,6 +1346,16 @@ class EnhancedCNNResearchTrainer:
         # Generate and save training curves
         curves_path = os.path.join(save_dir, 'training_curves.png')
         self._plot_training_curves(curves_path)
+        # Annotate with run/fold identifiers to avoid confusion when CV overwrites
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.open(curves_path)
+            draw = ImageDraw.Draw(img)
+            text = f"Run: {self.run_id}"
+            draw.text((10, 10), text, fill=(0, 0, 0))
+            img.save(curves_path)
+        except Exception:
+            pass
         print(f"📊 Training curves saved to {curves_path}")
         
         # Save the single best model for this training run
@@ -1392,7 +1520,7 @@ def main():
     # Combined with extended training and enhanced regularization for 60%+ target
     batch_size = 256              # Larger effective batch for stability; use AMP and gradient clipping
     epochs = 100                 # Extended for proven adaptive method → Should reach 55-60% faster
-    learning_rate = 2.8e-4       # Restored proven base LR to avoid instability with OneCycle
+    learning_rate = 1e-4       # Restored proven base LR to avoid instability with OneCycle
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
     test_size = 0.2
     random_state = 42
@@ -1410,16 +1538,18 @@ def main():
     print("=" * 60)
     
     # Load and preprocess data (now returns class weights too)
-    X_train, X_test, y_train, y_test, features_per_day, class_weights = load_and_preprocess_data(
+    X_train, X_test, y_train, y_test, features_per_day, class_weights, feature_columns = load_and_preprocess_data(
         csv_path, test_size, random_state
     )
     
+    # Run sanity diagnostics on the flattened features
+    run_sanity_diagnostics(X_train, y_train, X_test, y_test, feature_columns)
+
     # Create datasets - use the cleaned data from load_and_preprocess_data
     print(f"📊 Creating datasets...")
     
     # Load and clean data again for dataset creation (since we need raw unscaled data)
     df = pd.read_csv(csv_path)
-    feature_columns = [col for col in df.columns if col not in ['Ticker', 'Label', 'TargetRet', 'EndDate']]
     
     # Remove NaN rows (same as in load_and_preprocess_data)
     nan_rows = df[feature_columns].isna().any(axis=1)
@@ -1452,7 +1582,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # ----- Model Selection -----
-    MODEL_TYPE = "timesnet_hybrid"  # Using optimized version to prevent overfitting
+    MODEL_TYPE = "resnet_ts"  # options: timesnet_hybrid | resnet_ts | optimized_timesnet_hybrid | simple_cnn
     
     # 🔄 CHECKPOINT LOADING CONFIGURATION
     # =====================================
@@ -1490,6 +1620,8 @@ def main():
             patch_stride=1,
             use_series_norm=True
         )
+    elif MODEL_TYPE == "resnet_ts":
+        model = create_resnet_time_series(features_per_day=features_per_day, num_classes=3, base_channels=64, depth="50")
     elif MODEL_TYPE == "simple_cnn":
         from src.training.simple_cnn_trainer import SimpleCNN  # Lazy import
         model = SimpleCNN(features_per_day=features_per_day, num_classes=5)
@@ -1537,10 +1669,11 @@ def main():
             va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
             print(f"\n🧪 Fold {fold}/{n_splits} (embargo {embargo_frac*100:.1f}%): train={len(tr_ds)}, val={len(va_ds)}")
             fold_trainer = EnhancedCNNResearchTrainer(
-                model=create_timesnet_hybrid(features_per_day=features_per_day, num_classes=3, cnn_channels=512, timesnet_emb=512, timesnet_depth=5),
+                model=create_resnet_time_series(features_per_day=features_per_day, num_classes=3, base_channels=128, depth="medium"),
                 learning_rate=learning_rate,
                 weight_decay=weight_decay,
-                class_weights=class_weights
+                class_weights=class_weights,
+                debug_one_batch=True
             )
             fold_hist = fold_trainer.train(tr_loader, va_loader, epochs=epochs, save_dir=save_dir)
             # Fit temperature per fold

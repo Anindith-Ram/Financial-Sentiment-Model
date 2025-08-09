@@ -80,17 +80,29 @@ class ProfessionalDataCollector:
         
         # Default configuration
         self.config = {
-            "start_date": "2020-01-01",
+            "start_date": "2010-01-01",
             "end_date": datetime.now().strftime("%Y-%m-%d"),
             "sequence_length": 5,
-            "tickers": self._get_default_tickers(),
+            "tickers": ["AAPL"],  # start with one highly liquid stock for rapid iteration
             # Labeling configuration
-            # label_mode: 'rolling_quantiles' (original) or 'absolute_bands'
-            "label_mode": "absolute_bands",
-            # For absolute_bands: define neutral band and up/down thresholds (daily returns)
-            # Example: neutral if |ret| <= 0.0015 (0.15%), up if ret >= 0.003 (0.30%), down if ret <= -0.003
+            # Options: 'rolling_quantiles', 'absolute_bands', 'triple_barrier'
+            "label_mode": "triple_barrier",
+            # Absolute bands (fallback)
             "neutral_band": 0.002,
-            "up_down_threshold": 0.0035
+            "up_down_threshold": 0.0035,
+            # Triple-barrier params
+            "tb_atr_window": 20,
+            "tb_up_mult": 1.0,
+            "tb_dn_mult": 1.0,
+            "tb_t_limit": 5,
+            # Context features
+            "use_spy_context": True,
+            "use_sector_context": True,
+            # Cross-sectional ranks
+            "compute_cross_sectional": True,
+            # Liquidity/quality filters
+            "adv_window": 20,
+            "min_dollar_vol": 5_000_000.0,
         }
         
         logger.info(f"🏗️ Data Collector initialized")
@@ -236,6 +248,31 @@ class ProfessionalDataCollector:
         low_price = data['Low'].values
         close_price = data['Close'].values
         volume = data['Volume'].values
+
+        # Always compute basic pandas-based features FIRST so downstream steps don't break
+        # Price action features (decomposed returns and shape)
+        data['ret_close_close'] = data['Close'].pct_change()
+        data['ret_open_open'] = data['Open'].pct_change()
+        data['ret_overnight'] = data['Open'] / data['Close'].shift(1) - 1.0
+        data['ret_intraday'] = data['Close'] / data['Open'] - 1.0
+        data['high_low_ratio'] = data['High'] / data['Low']
+        data['close_open_ratio'] = data['Close'] / data['Open']
+        # Candle shape metrics
+        body = (data['Close'] - data['Open']).abs()
+        range_ = (data['High'] - data['Low']).replace(0, np.nan)
+        upper_wick = (data['High'] - data[['Open','Close']].max(axis=1)).clip(lower=0)
+        lower_wick = (data[['Open','Close']].min(axis=1) - data['Low']).clip(lower=0)
+        data['body_frac'] = (body / range_).fillna(0)
+        data['upper_wick_frac'] = (upper_wick / range_).fillna(0)
+        data['lower_wick_frac'] = (lower_wick / range_).fillna(0)
+        # High-Low realized variance estimators (robust even without talib)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_hl = np.log(data['High'] / data['Low']).replace([np.inf, -np.inf], np.nan)
+            log_co = np.log((data['Close'] / data['Open']).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        data['rv_parkinson'] = (1.0 / (4.0 * np.log(2))) * (log_hl ** 2)
+        data['rv_garman_klass'] = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+        data['rv_parkinson'] = data['rv_parkinson'].fillna(0)
+        data['rv_garman_klass'] = data['rv_garman_klass'].fillna(0)
         
         try:
             # Trend indicators with adaptive periods
@@ -266,6 +303,17 @@ class ProfessionalDataCollector:
                 data['bb_upper'], data['bb_middle'], data['bb_lower'] = talib.BBANDS(close_price, timeperiod=20)
                 data['bb_width'] = data['bb_upper'] - data['bb_lower']
                 data['bb_position'] = (close_price - data['bb_lower']) / data['bb_width']
+                # Keltner Channels (EMA + ATR)
+                ema = talib.EMA(close_price, timeperiod=20)
+                data['kc_upper'] = ema + 2.0 * data['atr']
+                data['kc_lower'] = ema - 2.0 * data['atr']
+                kc_width = (data['kc_upper'] - data['kc_lower']).replace(0, np.nan)
+                data['kc_position'] = ((data['Close'] - data['kc_lower']) / kc_width).fillna(0)
+                # Squeeze conditions and slopes
+                data['bb_squeeze_on'] = ((data['bb_upper'] < data['kc_upper']) & (data['bb_lower'] > data['kc_lower'])).astype(int)
+                data['kc_width'] = kc_width.fillna(0)
+                data['kc_squeeze_on'] = (data['kc_width'] <= data['kc_width'].rolling(20, min_periods=10).quantile(0.2)).astype(int)
+                data['kc_slope'] = (ema - pd.Series(ema).shift(1)).fillna(0)
             
             # Volume indicators
             if len(data) >= 20:
@@ -278,10 +326,7 @@ class ProfessionalDataCollector:
             data['pattern_morning_star'] = talib.CDLMORNINGSTAR(open_price, high_price, low_price, close_price)
             data['pattern_evening_star'] = talib.CDLEVENINGSTAR(open_price, high_price, low_price, close_price)
             
-            # Price action features
-            data['daily_return'] = data['Close'].pct_change()
-            data['high_low_ratio'] = data['High'] / data['Low']
-            data['close_open_ratio'] = data['Close'] / data['Open']
+            # (pandas-based features already computed above)
             
             logger.debug(f"✅ Calculated technical indicators")
             
@@ -319,6 +364,13 @@ class ProfessionalDataCollector:
         df['ret1'] = df['Close'].pct_change().shift(-1)
         past_ret = df['ret1'].shift(1)
 
+        # Liquidity/quality filters
+        adv_win = int(self.config.get('adv_window', 20))
+        min_dv = float(self.config.get('min_dollar_vol', 5_000_000.0))
+        df['dollar_vol'] = (df['Close'] * df['Volume']).fillna(0)
+        df['adv'] = df['dollar_vol'].rolling(adv_win, min_periods=adv_win//2).mean().fillna(method='bfill')
+        df = df[df['adv'] >= min_dv].copy()
+
         label_mode = self.config.get('label_mode', 'rolling_quantiles')
         if label_mode == 'absolute_bands':
             neutral_band = float(self.config.get('neutral_band', 0.0015))
@@ -326,6 +378,36 @@ class ProfessionalDataCollector:
             r = df['ret1']
             label3 = np.where(r <= -thr, 0, np.where(np.abs(r) <= neutral_band, 1, 2)).astype(int)
             label3 = np.where(r.isna(), 1, label3)
+        elif label_mode == 'triple_barrier':
+            # Volatility-scaled triple-barrier
+            atr_win = int(self.config.get('tb_atr_window', 20))
+            up_mult = float(self.config.get('tb_up_mult', 1.0))
+            dn_mult = float(self.config.get('tb_dn_mult', 1.0))
+            t_limit = int(self.config.get('tb_t_limit', 5))
+            # ATR as volatility proxy
+            atr = talib.ATR(df['High'].values, df['Low'].values, df['Close'].values, timeperiod=atr_win)
+            atr = pd.Series(atr, index=df.index).fillna(method='bfill')
+            labels = []
+            for i in range(len(df)):
+                if i + 1 >= len(df):
+                    labels.append(1)
+                    continue
+                entry = df.iloc[i]['Close']
+                up = entry + up_mult * atr.iloc[i]
+                dn = entry - dn_mult * atr.iloc[i]
+                end = min(i + t_limit, len(df) - 1)
+                path = df.iloc[i+1:end+1]
+                hit_up = (path['High'] >= up).any()
+                hit_dn = (path['Low'] <= dn).any()
+                if hit_up and not hit_dn:
+                    labels.append(2)
+                elif hit_dn and not hit_up:
+                    labels.append(0)
+                else:
+                    # time limit: compare end close vs entry (neutral band around 0)
+                    ret_tl = (df.iloc[end]['Close'] / entry) - 1.0
+                    labels.append(2 if ret_tl > 0 else (0 if ret_tl < 0 else 1))
+            label3 = np.array(labels, dtype=int)
         else:
             # Rolling 33/66% quantiles (original)
             q33 = past_ret.rolling(252, min_periods=60).quantile(0.33)
@@ -344,9 +426,17 @@ class ProfessionalDataCollector:
         df['mom_5'] = df['Close'].pct_change(5)
         df['mom_10'] = df['Close'].pct_change(10)
         df['mom_20'] = df['Close'].pct_change(20)
-        df['vol_5'] = df['Close'].pct_change().rolling(5).std()
-        df['vol_10'] = df['Close'].pct_change().rolling(10).std()
-        df['vol_20'] = df['Close'].pct_change().rolling(20).std()
+        # Volatility: realized and EWMA
+        ret = df['Close'].pct_change()
+        df['vol_5'] = ret.rolling(5).std()
+        df['vol_10'] = ret.rolling(10).std()
+        df['vol_20'] = ret.rolling(20).std()
+        lam = 0.94
+        ewma_var = ret.ewm(alpha=(1-lam), adjust=False).var()
+        df['ewma_vol'] = np.sqrt(ewma_var).fillna(method='bfill')
+        # Realized skew/kurtosis over 20 days
+        df['rv_skew_20'] = ret.rolling(20).skew().fillna(0)
+        df['rv_kurt_20'] = ret.rolling(20).kurt().fillna(0)
         df['turnover'] = (df['Volume'] / (df['Volume'].rolling(20).mean().replace(0, np.nan))).fillna(0)
         df['overnight_gap'] = (df['Open'] / df['Close'].shift(1) - 1)
         # Simple regime flags
@@ -354,8 +444,123 @@ class ProfessionalDataCollector:
         df['regime_high_vol'] = (vol20 > vol20.rolling(60, min_periods=20).median()).astype(int)
         df['regime_trending'] = (df['mom_20'].abs() > df['mom_20'].rolling(60, min_periods=20).median().abs()).astype(int)
 
+        # Context: market/sector returns and residualization; earnings proximity
+        if bool(self.config.get('use_spy_context', True)):
+            try:
+                spy = yf.download('SPY', start=df['Date'].min(), end=df['Date'].max(), auto_adjust=True, progress=False)
+                spy = spy.rename(columns={'Close': 'SPY_Close'})[['SPY_Close']]
+                spy['Date'] = spy.index.tz_localize(None).date
+                spy['SPY_ret'] = spy['SPY_Close'].pct_change()
+                df = df.merge(spy[['Date','SPY_ret']], on='Date', how='left')
+            except Exception:
+                df['SPY_ret'] = 0.0
+        if bool(self.config.get('use_sector_context', True)):
+            # Map Ticker -> Sector ETF (coarse GICS mapping; customize as needed)
+            sector_map = {
+                'XLB': ['LIN','APD','SHW','ECL','ALB','DD'],
+                'XLE': ['XOM','CVX','SLB','COP','EOG','PSX'],
+                'XLF': ['JPM','BAC','WFC','C','GS','MS'],
+                'XLI': ['HON','UPS','CAT','UNP','RTX','BA'],
+                'XLK': ['AAPL','MSFT','NVDA','AVGO','ADBE','CSCO'],
+                'XLP': ['PG','KO','PEP','WMT','COST','MDLZ'],
+                'XLU': ['NEE','DUK','SO','D','AEP','EXC'],
+                'XLV': ['UNH','JNJ','LLY','ABBV','PFE','TMO'],
+                'XLY': ['AMZN','HD','MCD','NKE','SBUX','TJX'],
+                'XLRE': ['AMT','PLD','CCI','EQIX','PSA','SPG'],
+                'XLC': ['GOOGL','META','NFLX','TMUS','VZ','CMCSA']
+            }
+            tkr = str(df['Ticker'].iloc[0]).upper()
+            # Find sector ETF by membership list (fallback to XLK for AAPL)
+            sector_etf = 'XLK'
+            for etf, members in sector_map.items():
+                if tkr in members:
+                    sector_etf = etf
+                    break
+            try:
+                sex = yf.download(sector_etf, start=df['Date'].min(), end=df['Date'].max(), auto_adjust=True, progress=False)
+                sex = sex.rename(columns={'Close': f'{sector_etf}_Close'})[[f'{sector_etf}_Close']]
+                sex['Date'] = sex.index.tz_localize(None).date
+                sex[f'{sector_etf}_ret'] = sex[f'{sector_etf}_Close'].pct_change()
+                df = df.merge(sex[['Date',f'{sector_etf}_ret']], on='Date', how='left')
+                df['SECTOR_ret'] = df[f'{sector_etf}_ret']
+            except Exception:
+                df['SECTOR_ret'] = 0.0
+
+        # Earnings proximity flags (best-effort via yfinance calendar; may be sparse)
+        try:
+            cal = yf.Ticker(df['Ticker'].iloc[0]).calendar
+            if cal is not None and 'Earnings Date' in cal.index:
+                ed = cal.loc['Earnings Date'].values
+                ed_dates = pd.to_datetime(pd.Series(ed).astype(str), errors='coerce').dt.date.dropna().unique()
+                if len(ed_dates) > 0:
+                    ed_df = pd.DataFrame({'Date': ed_dates, 'earn_flag': 1})
+                    df = df.merge(ed_df, on='Date', how='left')
+                    df['earn_flag'] = df['earn_flag'].fillna(0)
+                    # Proximity windows: simple rolling window around earnings
+                    df['earn_soon_5d'] = df['earn_flag'].rolling(5, min_periods=1).max().fillna(0)
+            else:
+                df['earn_flag'] = 0
+                df['earn_soon_5d'] = 0
+        except Exception:
+            df['earn_flag'] = 0
+            df['earn_soon_5d'] = 0
+
+        # Residualized returns (market and sector)
+        if 'SPY_ret' in df.columns:
+            roll = 60
+            # simple rolling beta via covariance/variance
+            cov = df['ret_close_close'].rolling(roll).cov(df['SPY_ret'])
+            var = df['SPY_ret'].rolling(roll).var().replace(0, np.nan)
+            beta = (cov / var).fillna(0)
+            df['residual_ret'] = (df['ret_close_close'] - beta * df['SPY_ret']).fillna(0)
+        else:
+            df['residual_ret'] = df['ret_close_close']
+        if 'SECTOR_ret' in df.columns:
+            roll = 60
+            cov_s = df['ret_close_close'].rolling(roll).cov(df['SECTOR_ret'])
+            var_s = df['SECTOR_ret'].rolling(roll).var().replace(0, np.nan)
+            beta_s = (cov_s / var_s).fillna(0)
+            df['residual_ret_sector'] = (df['ret_close_close'] - beta_s * df['SECTOR_ret']).fillna(0)
+        else:
+            df['residual_ret_sector'] = df['ret_close_close']
+
+        # Multiple-horizon residuals
+        for h in [5]:
+            ret_h = df['Close'].pct_change(h)
+            if 'SPY_ret' in df.columns:
+                spy_h = df['SPY_ret'].rolling(h).sum().fillna(0)
+                cov_h = ret_h.rolling(60).cov(spy_h)
+                var_h = spy_h.rolling(60).var().replace(0, np.nan)
+                beta_h = (cov_h / var_h).fillna(0)
+                df[f'residual_ret_{h}d'] = (ret_h - beta_h * spy_h).fillna(0)
+            else:
+                df[f'residual_ret_{h}d'] = ret_h.fillna(0)
+
+        # Cross-sectional z-scores/ranks per day (only meaningful with multi-stock; still computed safely)
+        if bool(self.config.get('compute_cross_sectional', True)):
+            for col in ['ret_close_close','ret_intraday','ret_overnight','vol_20','turnover','dollar_vol']:
+                if col in df.columns:
+                    g = df.groupby('Date')[col]
+                    df[f'{col}_z_cs'] = (g.transform(lambda s: (s - s.mean()) / (s.std() + 1e-6))).fillna(0)
+                    df[f'{col}_rank_cs'] = g.rank(pct=True).fillna(0)
+
+        # Calendar features
+        dt = pd.to_datetime(df['Date'])
+        df['dow'] = dt.dt.weekday
+        df['dom'] = dt.dt.day
+        df['month'] = dt.dt.month
+        # Simple U.S. holiday feature via pandas (best-effort)
+        try:
+            import pandas.tseries.holiday as ph
+            cal = ph.USFederalHolidayCalendar()
+            hol = cal.holidays(start=dt.min(), end=dt.max())
+            df['is_holiday'] = dt.isin(hol).astype(int)
+        except Exception:
+            df['is_holiday'] = 0
+
         # Get feature columns (exclude metadata & helper columns not needed at inference-time)
-        feature_cols = [col for col in df.columns if col not in ['Date', 'Ticker', 'ret1']]
+        exclude_cols = ['Date', 'Ticker', 'ret1', 'adv']
+        feature_cols = [col for col in df.columns if col not in exclude_cols]
         
         for i in range(len(df) - sequence_length):
             # Get sequence data
@@ -430,11 +635,12 @@ class ProfessionalDataCollector:
         core_cols = [c for c in final_dataset.columns if c.startswith('feature_')]  # sequence features only
         initial_count = len(final_dataset)
         # Identify OHLCV-derived slots if available (robust fallback: require at least 80% of features present)
+        coverage_threshold = 1.0
         non_na_ratio = final_dataset[core_cols].notna().mean(axis=1)
-        final_dataset = final_dataset[non_na_ratio >= 0.8].copy()
+        final_dataset = final_dataset[non_na_ratio >= coverage_threshold].copy()
         final_dataset = final_dataset.dropna(subset=['Label','Ticker'])
         final_count = len(final_dataset)
-        logger.info(f"🧹 Removed {initial_count - final_count:,} rows after 80% feature coverage filter")
+        logger.info(f"🧹 Removed {initial_count - final_count:,} rows after {coverage_threshold*100}% feature coverage filter")
         logger.info(f"✅ Final dataset: {final_count:,} samples")
         
         # Save dataset to correct location

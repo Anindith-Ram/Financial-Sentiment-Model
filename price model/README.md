@@ -1,224 +1,92 @@
-# 🚀 Professional Financial Modeling Pipeline
+# Price Model Pipeline
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Pipeline Status](https://img.shields.io/badge/pipeline-production--ready-green.svg)](.)
+This project forecasts next‑day stock movement using a 5‑day context window. It provides a clear, reproducible pipeline for data collection, modeling, training, and evaluation with time‑series‑aware cross‑validation.
 
-**Professional-grade financial modeling system for stock price prediction and trading signals using advanced neural networks.**
+- Data: `price model/data/`
+- Models: `price model/models/`
+- Source: `price model/src/`
 
-## ✨ Key Features
+## 1) Data pipeline
 
-- 🎯 **Advanced Neural Architecture**: Hybrid GPT-2 + Enhanced CNN
-- 📊 **Smart Data Management**: Optimized collection with automatic NaN handling  
-- 🛡️ **Production-Ready**: Comprehensive error handling and monitoring
-- ⚡ **Performance Optimized**: Mixed precision, gradient accumulation
-- 🔧 **Professional Structure**: Clean separation of concerns, no duplication
-- 📈 **Trading Signals**: Real-time signal generation
-- 🧪 **Research Tools**: Hyperparameter search and analysis
+File: `src/data/data_collection.py`
 
-## 🏆 Performance Metrics
+- Universe: S&P 500 from `data/constituents.csv` (Wikipedia fallback).
+- Source: Yahoo Finance (auto‑adjusted OHLCV) per ticker.
+- Indicators & features (per day): SMA/EMA, RSI, MACD, Stochastic, ATR, Bollinger, gaps, returns, turnover, realized vol(5/10/20), regime flags.
+- Sequence: 5‑day rolling window per ticker → flattened `feature_0..N-1`.
+- Labels: 3‑class with two modes
+  - `rolling_quantiles` (33/66% per‑ticker)
+  - `absolute_bands` (recommended): neutral if |ret| ≤ `neutral_band`; up if ret ≥ `up_down_threshold`; down if ≤ −`up_down_threshold`.
+- Extra columns: `TargetRet` (continuous next‑day return), `EndDate` (sequence end timestamp), `Ticker`.
 
-| Component | Metric | Value |
-|-----------|--------|-------|
-| **Model Accuracy** | Training/Validation | 51.5% / 51.6% |
-| **Data Quality** | Clean Data Retention | 89% (11.2% NaN removed) |
-| **Training Speed** | Throughput | 34 batches/second |
-| **Model Size** | Parameters | 130M (6.5M trainable) |
-
-## 🚀 Quick Start
-
-### Installation
+Run collection:
 ```bash
-git clone <repository-url>
-cd price-model
-pip install -r requirements.txt
+python src/data/data_collection.py --mode full
 ```
+Outputs: `data/professional_dataset_*.csv`, `data/latest_dataset.csv`, and a JSON quality report.
 
-### Basic Usage
-```bash
-# 1. Collect data
-python -m finmodel.core.pipeline data collect --mode smart_update
+## 2) Model architecture
 
-# 2. Train model (research mode)
-python -m finmodel.core.pipeline train --mode research --epochs 10
+File: `src/models/timesnet_hybrid.py`
 
-# 3. Train production model
-python -m finmodel.core.pipeline train --mode production --epochs 50
+- CNN branch for local pattern extraction.
+- PatchTST‑style TimesNet branch:
+  - Per‑series normalization across time (per sample)
+  - Time patch embedding (e.g., `patch_len=2/3`, `stride=1`) → Transformer blocks
+- Gated fusion → MLP trunk → dual heads:
+  - Classification head: logits for 3 classes
+  - Regression head: next‑day return prediction (optional Huber loss)
 
-# 4. Generate predictions
-python -m finmodel.core.pipeline predict --input data/new_data.csv
-
-# 5. Generate trading signals
-python -m finmodel.core.pipeline signals --live
-
-# 6. Check status
-python -m finmodel.core.pipeline status
-```
-
-## 📁 Professional Architecture
-
-```
-finmodel/                          # Main package
-├── core/pipeline.py              # Single entry point
-├── data/manager.py               # Unified data operations
-├── models/hybrid_model.py        # GPT-2 + CNN architecture
-├── training/orchestrator.py      # Unified training system
-├── inference/engine.py           # Prediction system
-└── utils/                        # Error handling, logging
-```
-
-**Key Design Principles:**
-- ✅ **Single Entry Point**: All operations through `pipeline.py`
-- ✅ **No Code Duplication**: Each component has single responsibility
-- ✅ **Professional Error Handling**: Comprehensive recovery and logging
-- ✅ **Performance Optimized**: Advanced training techniques
-- ✅ **Production Ready**: Robust, scalable, maintainable
-
-## 🎯 Model Architecture
-
-### Hybrid Neural Network
-- **GPT-2 Temporal Extractor**: 127M parameters for sequence understanding
-- **Enhanced CNN**: 788K parameters for pattern recognition
-- **Attention Fusion**: 361K parameters for feature combination
-- **5-Day Context**: Optimized for swing trading (1-3 day predictions)
-
-### Advanced Training Features
-- **Mixed Precision Training**: 2x speedup with minimal memory overhead
-- **Component-Specific Learning Rates**: Optimized for each model part
-- **Advanced Regularization**: MixUp, CutMix, Label Smoothing
-- **Automatic Hyperparameter Search**: Optuna-based optimization
-
-## 📊 Data Features
-
-### Technical Indicators (62 features per 5-day sequence)
-- **Trend**: SMA, EMA, trend strength, crossovers
-- **Momentum**: RSI, MACD, Stochastic, Williams %R
-- **Volatility**: ATR, Bollinger Bands
-- **Volume**: Volume ratios, OBV
-- **Patterns**: 4 key candlestick patterns
-- **Price Action**: Returns, gaps, ratios
-
-### Smart Data Processing
-- **Adaptive Indicators**: Periods adjust to data availability
-- **Quality Scoring**: Automatic assessment and filtering
-- **NaN Elimination**: 11.2% → 0% through intelligent preprocessing
-- **Hierarchical Calculation**: Dependencies resolved automatically
-
-## 🔧 Configuration
-
-### Training Modes
-```bash
-# Research mode - fast iterations
-python -m finmodel.core.pipeline train --mode research --epochs 10
-
-# Production mode - full optimization
-python -m finmodel.core.pipeline train --mode production --epochs 100
-
-# Hyperparameter search
-python -m finmodel.core.pipeline train --mode hyperparameter_search
-```
-
-### Python API
+Factory:
 ```python
-from finmodel import FinancialPipeline
-
-with FinancialPipeline() as pipeline:
-    # Collect data
-    pipeline.collect_data(mode="smart_update")
-    
-    # Train model
-    pipeline.train_model(mode="production", epochs=50)
-    
-    # Generate predictions
-    predictions = pipeline.predict("data/test.csv")
-    
-    # Trading signals
-    signals = pipeline.generate_signals(live=True)
+create_timesnet_hybrid(features_per_day, num_classes=3,
+  cnn_channels=512, timesnet_emb=512, timesnet_depth=5,
+  seq_len=5, patch_len=2, patch_stride=1, use_series_norm=True)
 ```
 
-## 🛡️ Error Handling & Monitoring
+## 3) Training
 
-### Professional Error Management
-- **Structured Exception Hierarchy**: Specific error types
-- **Automatic Recovery**: Retry with exponential backoff
-- **Detailed Logging**: JSON-structured logs with context
-- **Performance Monitoring**: Real-time metrics
-- **User-Friendly Messages**: Clear descriptions and suggestions
+File: `src/training/research_trainer.py`
 
-### System Monitoring
+- Optimizer: AdamW with per‑component LR ratios
+  - TimesNet: 0.05×, CNN: 1.0×, Head: 1.0×, weight_decay=1e‑4
+- Scheduler: OneCycleLR (pct_start=0.10, peak ≈ 2× per group, cosine anneal)
+- Regularization: MixUp=0.1, CutMix=0.0, label smoothing=0.02 (kept light for fast learning)
+- Gradient clipping: 0.05–0.1; EMA evaluation enabled
+- Losses: CrossEntropy (primary) + optional Huber on `TargetRet` (λ=0.2)
+- Metrics each epoch: Accuracy, Macro‑F1, AUROC(OVR), Precision@Top‑1%; LR (max group)
+- Artifacts per run (`run_id`): best checkpoint, training history JSON, curves PNG (stamped with `run_id`).
+
+Run:
 ```bash
-# Check system status
-python -m finmodel.core.pipeline status
-
-# View errors with suggestions
-python -m finmodel.core.pipeline logs --errors
+python src/training/research_trainer.py
 ```
 
-## 📈 Results Format
+### Purged time‑series CV (opt‑in)
+- Chronological K‑fold sorted by `EndDate` (no shuffle), with embargo (e.g., 2%) after each validation window.
+- Enable in trainer: `use_cv=True`, `n_splits=5`, `embargo_frac=0.02`.
+- Each fold produces its own checkpoint/history/curves (PNG stamped with `run_id`). You can ensemble fold models by averaging probabilities.
 
-### Predictions
-```python
-{
-  "predictions": [0, 1, 2, 1, 0],
-  "confidences": [0.89, 0.76, 0.82, 0.91, 0.73],
-  "metadata": {
-    "model_version": "v3.0.0",
-    "processing_time_ms": 234
-  }
-}
-```
+## 4) High‑impact knobs
 
-### Trading Signals
-```python
-{
-  "signals": {
-    "AAPL": {
-      "signal": "BUY",
-      "confidence": 0.87,
-      "target_price": 185.50,
-      "expected_return": 4.07
-    }
-  }
-}
-```
+- Labels: `label_mode` (absolute bands), `neutral_band`, `up_down_threshold`
+- Model: `patch_len`, `use_series_norm`
+- Optimizer/scheduler: base LR (1e‑4 – 3e‑4), TimesNet ratio (0.05–0.1×), pct_start (0.05–0.15), peak multiplier (2–2.5×)
+- Regularization: MixUp/CutMix prob, smoothing (0.02–0.05)
+- Evaluation: temperature scaling (on), `select_threshold` for abstention
 
-## 🚀 Production Features
+## 5) Production & inference
 
-- **Model Versioning**: Automatic checkpoint management
-- **Performance Profiling**: Built-in optimization tools
-- **Batch Processing**: Efficient large-scale inference
-- **Real-time Serving**: Low-latency prediction API
-- **Automated Retraining**: Scheduled model updates
+- Production and progressive trainers are dual‑head compatible (use logits for loss/metrics).
+- Inference can load the best single model or ensemble fold models; temperature scaling and thresholds can be applied to probabilities.
 
-## 🔬 Research Tools
+## 6) Typical recipes
 
-- **Hyperparameter Optimization**: Automated tuning with Optuna
-- **Ablation Studies**: Component importance analysis
-- **Model Interpretability**: Feature importance and explanations
-- **Performance Benchmarking**: Comprehensive model comparisons
+- Fast learner: CE only, MixUp 0.1, smoothing 0.02, pct_start=0.1, peak 2×, TimesNet 0.1× for first 20 epochs then 0.05×.
+- CV selection: 5 folds, embargo 2%, select by Macro‑F1 or Precision@1%.
+- Higher ceiling: add cross‑sectional daily z‑scores/sector one‑hot; ensemble folds; add LightGBM stacker on deep logits.
 
-## 📄 Support
+## 7) Paths
 
-### Getting Help
-1. **System Status**: `python -m finmodel.core.pipeline status`
-2. **Logs**: Check `logs/` directory for details
-3. **Error Messages**: Include troubleshooting suggestions
-
-### Common Solutions
-```bash
-# Memory issues
---batch-size 32 --gradient-accumulation-steps 2
-
-# CUDA memory
---mixed-precision --batch-size 16
-
-# Data quality
-python -m finmodel.core.pipeline data validate
-```
-
----
-
-**🚀 Professional Financial Modeling Pipeline v3.0**  
-*Production-Ready • Performance-Optimized • Professionally-Structured*
-
-Ready to start? Run `python -m finmodel.core.pipeline status`
+- Data: `data/latest_dataset.csv`, `data/professional_dataset_*.csv` + reports
+- Models: `models/research/enhanced_cnn_best_<run_id>.pth`, `models/research/training_history.json`, `models/research/training_curves.png`
