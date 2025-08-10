@@ -80,10 +80,11 @@ class ProfessionalDataCollector:
         
         # Default configuration
         self.config = {
-            "start_date": "2010-01-01",
+            "start_date": "2015-01-01",
             "end_date": datetime.now().strftime("%Y-%m-%d"),
             "sequence_length": 5,
-            "tickers": ["AAPL"],  # start with one highly liquid stock for rapid iteration
+            # Use full S&P 500 by default (constituents.csv → Wikipedia fallback)
+            "tickers": self._get_default_tickers(),
             # Labeling configuration
             # Options: 'rolling_quantiles', 'absolute_bands', 'triple_barrier'
             "label_mode": "triple_barrier",
@@ -94,7 +95,8 @@ class ProfessionalDataCollector:
             "tb_atr_window": 20,
             "tb_up_mult": 1.0,
             "tb_dn_mult": 1.0,
-            "tb_t_limit": 5,
+            "tb_t_limit": 7,
+            "tb_neutral_band": 0.001,  # treat small time-limit returns as neutral
             # Context features
             "use_spy_context": True,
             "use_sector_context": True,
@@ -103,6 +105,10 @@ class ProfessionalDataCollector:
             # Liquidity/quality filters
             "adv_window": 20,
             "min_dollar_vol": 5_000_000.0,
+            # Coverage gate on sequence features
+            "coverage_threshold": 0.9,
+            # Label auto-tuning to verify and fix mislabeling
+            "auto_tune_labels": True,
         }
         
         logger.info(f"🏗️ Data Collector initialized")
@@ -384,6 +390,7 @@ class ProfessionalDataCollector:
             up_mult = float(self.config.get('tb_up_mult', 1.0))
             dn_mult = float(self.config.get('tb_dn_mult', 1.0))
             t_limit = int(self.config.get('tb_t_limit', 5))
+            neutral_band_tl = float(self.config.get('tb_neutral_band', 0.001))
             # ATR as volatility proxy
             atr = talib.ATR(df['High'].values, df['Low'].values, df['Close'].values, timeperiod=atr_win)
             atr = pd.Series(atr, index=df.index).fillna(method='bfill')
@@ -404,9 +411,12 @@ class ProfessionalDataCollector:
                 elif hit_dn and not hit_up:
                     labels.append(0)
                 else:
-                    # time limit: compare end close vs entry (neutral band around 0)
+                    # time limit: small absolute return → neutral, else sign
                     ret_tl = (df.iloc[end]['Close'] / entry) - 1.0
-                    labels.append(2 if ret_tl > 0 else (0 if ret_tl < 0 else 1))
+                    if abs(ret_tl) <= neutral_band_tl:
+                        labels.append(1)
+                    else:
+                        labels.append(2 if ret_tl > 0 else 0)
             label3 = np.array(labels, dtype=int)
         else:
             # Rolling 33/66% quantiles (original)
@@ -420,6 +430,48 @@ class ProfessionalDataCollector:
             if mask.any():
                 label3[mask.values] = np.where(df.loc[mask, 'ret1'] < med[mask], 0, 2)
             label3 = np.where(df['ret1'].isna(), 1, label3)
+
+        # Optional: sanity check labels and auto-tune thresholds if class is missing or extreme imbalance
+        if bool(self.config.get('auto_tune_labels', True)):
+            counts = pd.Series(label3).value_counts().reindex([0,1,2]).fillna(0).astype(int)
+            # If any class is missing or neutral < 5%, attempt to widen neutral band or time limit
+            if (counts == 0).any() or (counts.get(1,0) < 0.05 * len(label3)):
+                if label_mode == 'triple_barrier':
+                    # widen neutral band at time-limit and/or extend time limit by 2 days
+                    nb = float(self.config.get('tb_neutral_band', 0.001))
+                    tl_ext = int(self.config.get('tb_t_limit', 5)) + 2
+                    atr_win = int(self.config.get('tb_atr_window', 20))
+                    up_mult = float(self.config.get('tb_up_mult', 1.0))
+                    dn_mult = float(self.config.get('tb_dn_mult', 1.0))
+                    atr = talib.ATR(df['High'].values, df['Low'].values, df['Close'].values, timeperiod=atr_win)
+                    atr = pd.Series(atr, index=df.index).fillna(method='bfill')
+                    labels2 = []
+                    for i in range(len(df)):
+                        if i + 1 >= len(df):
+                            labels2.append(1)
+                            continue
+                        entry = df.iloc[i]['Close']
+                        up = entry + up_mult * atr.iloc[i]
+                        dn = entry - dn_mult * atr.iloc[i]
+                        end = min(i + tl_ext, len(df) - 1)
+                        path = df.iloc[i+1:end+1]
+                        hit_up = (path['High'] >= up).any()
+                        hit_dn = (path['Low'] <= dn).any()
+                        if hit_up and not hit_dn:
+                            labels2.append(2)
+                        elif hit_dn and not hit_up:
+                            labels2.append(0)
+                        else:
+                            ret_tl = (df.iloc[end]['Close'] / entry) - 1.0
+                            labels2.append(1 if abs(ret_tl) <= (nb*1.5) else (2 if ret_tl > 0 else 0))
+                    label3 = np.array(labels2, dtype=int)
+                elif label_mode == 'absolute_bands':
+                    # widen neutral band by 25%
+                    neutral_band = float(self.config.get('neutral_band', 0.0015)) * 1.25
+                    thr = float(self.config.get('up_down_threshold', 0.003))
+                    r = df['ret1']
+                    label3 = np.where(r <= -thr, 0, np.where(np.abs(r) <= neutral_band, 1, 2)).astype(int)
+                    label3 = np.where(r.isna(), 1, label3)
 
         # Add richer features (momentum, volatility, gaps, simple regime flags)
         df['ret1_abs'] = df['ret1'].abs()
@@ -631,11 +683,10 @@ class ProfessionalDataCollector:
         logger.info("🔗 Combining sequences...")
         final_dataset = pd.concat(all_sequences, ignore_index=True)
         
-        # Smart NaN handling: drop only rows missing core OHLCV, keep rows with missing secondary indicators
+        # Smart NaN handling with configurable threshold on sequence feature coverage
         core_cols = [c for c in final_dataset.columns if c.startswith('feature_')]  # sequence features only
         initial_count = len(final_dataset)
-        # Identify OHLCV-derived slots if available (robust fallback: require at least 80% of features present)
-        coverage_threshold = 1.0
+        coverage_threshold = float(self.config.get('coverage_threshold', 0.9))
         non_na_ratio = final_dataset[core_cols].notna().mean(axis=1)
         final_dataset = final_dataset[non_na_ratio >= coverage_threshold].copy()
         final_dataset = final_dataset.dropna(subset=['Label','Ticker'])

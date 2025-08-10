@@ -18,6 +18,8 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import json
@@ -854,21 +856,30 @@ class EnhancedCNNResearchTrainer:
             y_true = np.concatenate(f1_targets) if f1_targets else np.array([])
             y_pred = np.concatenate(f1_preds) if f1_preds else np.array([])
             macro_f1 = f1_score(y_true, y_pred, average='macro') if y_true.size else 0.0
-            # AUROC (OVR) requires probs and at least two classes present
+            # AUROC (safe OVR): align columns to present classes; skip if <2 classes
             auroc = 0.0
+            y_true_prob = None
+            y_prob = None
             if prob_targets:
                 y_true_prob = np.concatenate(prob_targets)
                 y_prob = np.concatenate(prob_preds)
-                if len(np.unique(y_true_prob)) > 1:
-                    auroc = roc_auc_score(y_true_prob, y_prob, multi_class='ovr')
-            # Precision@k (top-k by confidence in class 2 "up" as example)
+                present = np.unique(y_true_prob).astype(int)
+                if present.size >= 2:
+                    try:
+                        # Subselect score columns to the present labels and pass labels explicitly
+                        y_prob_aligned = y_prob[:, present]
+                        auroc = roc_auc_score(y_true_prob, y_prob_aligned, multi_class='ovr', labels=present)
+                    except Exception:
+                        auroc = 0.0
+            # Precision@k (top 1% by prob of class 2 "up")
             precision_at_k = 0.0
-            if prob_targets:
-                k = max(1, int(0.01 * len(y_true)))  # top 1%
-                up_probs = y_prob[:, 2] if y_prob.shape[1] >= 3 else y_prob.max(axis=1)
+            if y_true_prob is not None and y_prob is not None and y_true.size:
+                k = max(1, int(0.01 * len(y_true)))
+                up_col = 2 if y_prob.shape[1] > 2 else np.argmax(y_prob.mean(axis=0))
+                up_probs = y_prob[:, up_col]
                 topk_idx = np.argsort(-up_probs)[:k]
-                precision_at_k = (y_true_prob[topk_idx] == 2).mean() if k > 0 else 0.0
-            coverage = coverage_counter / len(y_true_prob) if prob_targets else 0.0
+                precision_at_k = (y_true_prob[topk_idx] == up_col).mean() if k > 0 else 0.0
+            coverage = coverage_counter / len(y_true_prob) if (y_true_prob is not None and len(y_true_prob) > 0) else 0.0
             selective_precision = (positive_correct / coverage_counter) if coverage_counter > 0 else 0.0
             # Save to history arrays
             self.val_macro_f1s.append(float(macro_f1))
@@ -1518,7 +1529,7 @@ def main():
     # ============================================================
     # These settings use the proven adaptive scheduler that achieved 53.7%
     # Combined with extended training and enhanced regularization for 60%+ target
-    batch_size = 256              # Larger effective batch for stability; use AMP and gradient clipping
+    batch_size = 512              # Larger effective batch for stability; use AMP and gradient clipping
     epochs = 100                 # Extended for proven adaptive method → Should reach 55-60% faster
     learning_rate = 1e-4       # Restored proven base LR to avoid instability with OneCycle
     weight_decay = 5e-4          # Increased from 1e-4 → Stronger L2 regularization
@@ -1559,8 +1570,13 @@ def main():
     y_raw = df_clean['Label'].values.astype(np.int64)
     
     # Split raw data (will be replaced by purged CV when enabled)
+    # Fallback to non-stratified split if any class has <2 samples (common with single-ticker + tight coverage)
+    class_counts_raw = np.bincount(y_raw, minlength=3)
+    stratify_param = y_raw if (class_counts_raw >= 2).all() else None
+    if stratify_param is None:
+        print(f"⚠️  Stratified split disabled: class counts {class_counts_raw.tolist()} (need ≥2 per class). Using random split.")
     X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
-        X_raw, y_raw, test_size=test_size, random_state=random_state, stratify=y_raw
+        X_raw, y_raw, test_size=test_size, random_state=random_state, stratify=stratify_param
     )
     
     # If continuous target present, keep alongside for an optional regression head
@@ -1675,7 +1691,12 @@ def main():
                 class_weights=class_weights,
                 debug_one_batch=True
             )
+            # Save each fold's curves to a distinct file
             fold_hist = fold_trainer.train(tr_loader, va_loader, epochs=epochs, save_dir=save_dir)
+            try:
+                fold_trainer.plot_training_curves(os.path.join(save_dir, f'training_curves_fold{fold}.png'))
+            except Exception:
+                pass
             # Fit temperature per fold
             if getattr(fold_trainer, 'use_temperature_scaling', False):
                 temp_value = fold_trainer.fit_temperature(va_loader)
@@ -1684,6 +1705,29 @@ def main():
             if fold_trainer.best_val_acc > best_macro_f1:
                 best_macro_f1 = fold_trainer.best_val_acc
         print(f"\n✅ CV completed. Best fold metric: {best_macro_f1:.2f}")
+        # Save a combined curves image: append fold-specific PNGs into a grid or save separate files
+        try:
+            import math
+            from PIL import Image
+            fold_imgs = []
+            for f in range(1, fold+1):
+                p = os.path.join(save_dir, f"training_curves_fold{f}.png")
+                if os.path.exists(p):
+                    fold_imgs.append(Image.open(p).convert('RGB'))
+            if fold_imgs:
+                cols = min(3, len(fold_imgs))
+                rows = math.ceil(len(fold_imgs)/cols)
+                w, h = fold_imgs[0].size
+                grid = Image.new('RGB', (cols*w, rows*h), color=(255,255,255))
+                for i, im in enumerate(fold_imgs):
+                    r = i // cols
+                    c = i % cols
+                    grid.paste(im, (c*w, r*h))
+                grid_path = os.path.join(save_dir, 'training_curves_all_folds.png')
+                grid.save(grid_path)
+                print(f"🖼️  Combined CV curves saved: {grid_path}")
+        except Exception as e:
+            print(f"⚠️  Could not combine fold plots: {e}")
         history = {"cv_best": best_macro_f1}
     else:
         # Train model (single split)
