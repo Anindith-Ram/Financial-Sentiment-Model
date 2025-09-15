@@ -3,7 +3,7 @@ echo Setting up Financial Sentiment Pipeline Environment
 echo.
 
 REM Set your NewsAPI key here (get free key from https://newsapi.org/)
-set NEWSAPI_KEY="438b09a89fd141718796f1a9e79ad88d"
+set NEWSAPI_KEY="______"
 
 REM Optional: Set other API keys if you have them
 REM set FINNHUB_API_KEY=your_finnhub_key_here
