@@ -3,7 +3,7 @@ echo Starting Combined Sentiment Pipeline
 echo.
 
 REM Set your NewsAPI key
-set NEWSAPI_KEY=438b09a89fd141718796f1a9e79ad88d
+set NEWSAPI_KEY=_____
 
 echo Running combined sentiment pipeline...
 echo.
